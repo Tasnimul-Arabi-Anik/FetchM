@@ -9,7 +9,7 @@ setup(
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
     url="https://github.com/Tasnimul-Arabi-Anik/fetchM",
-    py_modules=["fetchM"],  # Specify the standalone script here
+    scripts=["bin/fetchM"],  # Include the script from the bin directory
     install_requires=[
         "pandas",
         "requests",
@@ -19,11 +19,6 @@ setup(
         "scipy",
         "tqdm"
     ],
-    entry_points={
-        "console_scripts": [
-            "fetchM=fetchM:main",  # Point to the script and function
-        ],
-    },
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: MIT License",
