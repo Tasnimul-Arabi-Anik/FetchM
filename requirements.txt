@@ -1,0 +1,9 @@
+pandas
+requests
+xmltodict
+matplotlib
+seaborn
+scipy
+tqdm
+argparse
+
