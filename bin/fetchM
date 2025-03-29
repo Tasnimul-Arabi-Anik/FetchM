@@ -222,16 +222,27 @@ def plot_scatter_with_trend_and_corr(
         # Ensure x and y are numeric
         x_numeric = pd.to_numeric(x, errors="coerce")
         y_numeric = pd.to_numeric(y, errors="coerce")
+        
+        # Create a DataFrame and drop NA values
+        plot_data = pd.DataFrame({'x': x_numeric, 'y': y_numeric}).dropna()
+        
+        if len(plot_data) == 0:
+            logging.warning(f"No valid data points for {title}")
+            return
+            
+        if len(plot_data['x']) != len(plot_data['y']):
+            logging.error(f"Data length mismatch for {title}: x={len(plot_data['x'])}, y={len(plot_data['y'])}")
+            return
 
         # Compute Pearson correlation coefficient
-        r_value, p_value = stats.pearsonr(x_numeric.dropna(), y_numeric.dropna())
+        r_value, p_value = stats.pearsonr(plot_data['x'], plot_data['y'])
 
         # Scatter plot with regression line
-        sns.regplot(x=x_numeric, y=y_numeric, scatter_kws={"alpha": 0.5}, line_kws={"color": "red"})
+        sns.regplot(x=plot_data['x'], y=plot_data['y'], scatter_kws={"alpha": 0.5}, line_kws={"color": "red"})
 
         # Annotate with correlation coefficient
         plt.text(
-            x_numeric.min(), y_numeric.max(),
+            plot_data['x'].min(), plot_data['y'].max(),
             f"r = {r_value:.3f} (p={p_value:.3f})",
             fontsize=12, color="black", bbox=dict(facecolor="white", alpha=0.7)
         )
@@ -332,6 +343,321 @@ def generate_assembly_summary(df: pd.DataFrame, output_file: str) -> None:
         logging.error(f"Error generating assembly summary: {e}")
         raise
 
+
+COUNTRY_MAPPING = {
+    # Africa (54 countries)
+    "Algeria": {"Continent": "Africa", "Subcontinent": "Northern Africa"},
+    "Angola": {"Continent": "Africa", "Subcontinent": "Middle Africa"},
+    "Benin": {"Continent": "Africa", "Subcontinent": "Western Africa"},
+    "Botswana": {"Continent": "Africa", "Subcontinent": "Southern Africa"},
+    "Burkina Faso": {"Continent": "Africa", "Subcontinent": "Western Africa"},
+    "Burundi": {"Continent": "Africa", "Subcontinent": "Eastern Africa"},
+    "Cabo Verde": {"Continent": "Africa", "Subcontinent": "Western Africa"},
+    "Cameroon": {"Continent": "Africa", "Subcontinent": "Middle Africa"},
+    "Central African Republic": {"Continent": "Africa", "Subcontinent": "Middle Africa"},
+    "Chad": {"Continent": "Africa", "Subcontinent": "Middle Africa"},
+    "Comoros": {"Continent": "Africa", "Subcontinent": "Eastern Africa"},
+    "Congo": {"Continent": "Africa", "Subcontinent": "Middle Africa"},
+    "Democratic Republic of the Congo": {"Continent": "Africa", "Subcontinent": "Middle Africa"},
+    "Djibouti": {"Continent": "Africa", "Subcontinent": "Eastern Africa"},
+    "Egypt": {"Continent": "Africa", "Subcontinent": "Northern Africa"},
+    "Equatorial Guinea": {"Continent": "Africa", "Subcontinent": "Middle Africa"},
+    "Eritrea": {"Continent": "Africa", "Subcontinent": "Eastern Africa"},
+    "Eswatini": {"Continent": "Africa", "Subcontinent": "Southern Africa"},
+    "Ethiopia": {"Continent": "Africa", "Subcontinent": "Eastern Africa"},
+    "Gabon": {"Continent": "Africa", "Subcontinent": "Middle Africa"},
+    "Gambia": {"Continent": "Africa", "Subcontinent": "Western Africa"},
+    "Ghana": {"Continent": "Africa", "Subcontinent": "Western Africa"},
+    "Guinea": {"Continent": "Africa", "Subcontinent": "Western Africa"},
+    "Guinea-Bissau": {"Continent": "Africa", "Subcontinent": "Western Africa"},
+    "Ivory Coast": {"Continent": "Africa", "Subcontinent": "Western Africa"},
+    "Kenya": {"Continent": "Africa", "Subcontinent": "Eastern Africa"},
+    "Lesotho": {"Continent": "Africa", "Subcontinent": "Southern Africa"},
+    "Liberia": {"Continent": "Africa", "Subcontinent": "Western Africa"},
+    "Libya": {"Continent": "Africa", "Subcontinent": "Northern Africa"},
+    "Madagascar": {"Continent": "Africa", "Subcontinent": "Eastern Africa"},
+    "Malawi": {"Continent": "Africa", "Subcontinent": "Eastern Africa"},
+    "Mali": {"Continent": "Africa", "Subcontinent": "Western Africa"},
+    "Mauritania": {"Continent": "Africa", "Subcontinent": "Western Africa"},
+    "Mauritius": {"Continent": "Africa", "Subcontinent": "Eastern Africa"},
+    "Morocco": {"Continent": "Africa", "Subcontinent": "Northern Africa"},
+    "Mozambique": {"Continent": "Africa", "Subcontinent": "Eastern Africa"},
+    "Namibia": {"Continent": "Africa", "Subcontinent": "Southern Africa"},
+    "Niger": {"Continent": "Africa", "Subcontinent": "Western Africa"},
+    "Nigeria": {"Continent": "Africa", "Subcontinent": "Western Africa"},
+    "Rwanda": {"Continent": "Africa", "Subcontinent": "Eastern Africa"},
+    "Sao Tome and Principe": {"Continent": "Africa", "Subcontinent": "Middle Africa"},
+    "Senegal": {"Continent": "Africa", "Subcontinent": "Western Africa"},
+    "Seychelles": {"Continent": "Africa", "Subcontinent": "Eastern Africa"},
+    "Sierra Leone": {"Continent": "Africa", "Subcontinent": "Western Africa"},
+    "Somalia": {"Continent": "Africa", "Subcontinent": "Eastern Africa"},
+    "South Africa": {"Continent": "Africa", "Subcontinent": "Southern Africa"},
+    "South Sudan": {"Continent": "Africa", "Subcontinent": "Eastern Africa"},
+    "Sudan": {"Continent": "Africa", "Subcontinent": "Northern Africa"},
+    "Tanzania": {"Continent": "Africa", "Subcontinent": "Eastern Africa"},
+    "Togo": {"Continent": "Africa", "Subcontinent": "Western Africa"},
+    "Tunisia": {"Continent": "Africa", "Subcontinent": "Northern Africa"},
+    "Uganda": {"Continent": "Africa", "Subcontinent": "Eastern Africa"},
+    "Zambia": {"Continent": "Africa", "Subcontinent": "Eastern Africa"},
+    "Zimbabwe": {"Continent": "Africa", "Subcontinent": "Eastern Africa"},
+
+    # Asia (48 countries)
+    "Afghanistan": {"Continent": "Asia", "Subcontinent": "Southern Asia"},
+    "Armenia": {"Continent": "Asia", "Subcontinent": "Western Asia"},
+    "Azerbaijan": {"Continent": "Asia", "Subcontinent": "Western Asia"},
+    "Bahrain": {"Continent": "Asia", "Subcontinent": "Western Asia"},
+    "Bangladesh": {"Continent": "Asia", "Subcontinent": "Southern Asia"},
+    "Bhutan": {"Continent": "Asia", "Subcontinent": "Southern Asia"},
+    "Brunei": {"Continent": "Asia", "Subcontinent": "South-Eastern Asia"},
+    "Cambodia": {"Continent": "Asia", "Subcontinent": "South-Eastern Asia"},
+    "China": {"Continent": "Asia", "Subcontinent": "Eastern Asia"},
+    "Cyprus": {"Continent": "Asia", "Subcontinent": "Western Asia"},
+    "Georgia": {"Continent": "Asia", "Subcontinent": "Western Asia"},
+    "India": {"Continent": "Asia", "Subcontinent": "Southern Asia"},
+    "Indonesia": {"Continent": "Asia", "Subcontinent": "South-Eastern Asia"},
+    "Iran": {"Continent": "Asia", "Subcontinent": "Southern Asia"},
+    "Iraq": {"Continent": "Asia", "Subcontinent": "Western Asia"},
+    "Israel": {"Continent": "Asia", "Subcontinent": "Western Asia"},
+    "Japan": {"Continent": "Asia", "Subcontinent": "Eastern Asia"},
+    "Jordan": {"Continent": "Asia", "Subcontinent": "Western Asia"},
+    "Kazakhstan": {"Continent": "Asia", "Subcontinent": "Central Asia"},
+    "Kuwait": {"Continent": "Asia", "Subcontinent": "Western Asia"},
+    "Kyrgyzstan": {"Continent": "Asia", "Subcontinent": "Central Asia"},
+    "Laos": {"Continent": "Asia", "Subcontinent": "South-Eastern Asia"},
+    "Lebanon": {"Continent": "Asia", "Subcontinent": "Western Asia"},
+    "Malaysia": {"Continent": "Asia", "Subcontinent": "South-Eastern Asia"},
+    "Maldives": {"Continent": "Asia", "Subcontinent": "Southern Asia"},
+    "Mongolia": {"Continent": "Asia", "Subcontinent": "Eastern Asia"},
+    "Myanmar": {"Continent": "Asia", "Subcontinent": "South-Eastern Asia"},
+    "Nepal": {"Continent": "Asia", "Subcontinent": "Southern Asia"},
+    "North Korea": {"Continent": "Asia", "Subcontinent": "Eastern Asia"},
+    "Oman": {"Continent": "Asia", "Subcontinent": "Western Asia"},
+    "Pakistan": {"Continent": "Asia", "Subcontinent": "Southern Asia"},
+    "Palestine": {"Continent": "Asia", "Subcontinent": "Western Asia"},
+    "Philippines": {"Continent": "Asia", "Subcontinent": "South-Eastern Asia"},
+    "Qatar": {"Continent": "Asia", "Subcontinent": "Western Asia"},
+    "Russia": {"Continent": "Asia", "Subcontinent": "Northern Asia"},
+    "Saudi Arabia": {"Continent": "Asia", "Subcontinent": "Western Asia"},
+    "Singapore": {"Continent": "Asia", "Subcontinent": "South-Eastern Asia"},
+    "South Korea": {"Continent": "Asia", "Subcontinent": "Eastern Asia"},
+    "Sri Lanka": {"Continent": "Asia", "Subcontinent": "Southern Asia"},
+    "Syria": {"Continent": "Asia", "Subcontinent": "Western Asia"},
+    "Tajikistan": {"Continent": "Asia", "Subcontinent": "Central Asia"},
+    "Thailand": {"Continent": "Asia", "Subcontinent": "South-Eastern Asia"},
+    "Timor-Leste": {"Continent": "Asia", "Subcontinent": "South-Eastern Asia"},
+    "Turkey": {"Continent": "Asia", "Subcontinent": "Western Asia"},
+    "Turkmenistan": {"Continent": "Asia", "Subcontinent": "Central Asia"},
+    "United Arab Emirates": {"Continent": "Asia", "Subcontinent": "Western Asia"},
+    "Uzbekistan": {"Continent": "Asia", "Subcontinent": "Central Asia"},
+    "Vietnam": {"Continent": "Asia", "Subcontinent": "South-Eastern Asia"},
+    "Yemen": {"Continent": "Asia", "Subcontinent": "Western Asia"},
+
+    # Europe (44 countries)
+    "Albania": {"Continent": "Europe", "Subcontinent": "Southern Europe"},
+    "Andorra": {"Continent": "Europe", "Subcontinent": "Southern Europe"},
+    "Austria": {"Continent": "Europe", "Subcontinent": "Western Europe"},
+    "Belarus": {"Continent": "Europe", "Subcontinent": "Eastern Europe"},
+    "Belgium": {"Continent": "Europe", "Subcontinent": "Western Europe"},
+    "Bosnia and Herzegovina": {"Continent": "Europe", "Subcontinent": "Southern Europe"},
+    "Bulgaria": {"Continent": "Europe", "Subcontinent": "Eastern Europe"},
+    "Croatia": {"Continent": "Europe", "Subcontinent": "Southern Europe"},
+    "Czech Republic": {"Continent": "Europe", "Subcontinent": "Eastern Europe"},
+    "Denmark": {"Continent": "Europe", "Subcontinent": "Northern Europe"},
+    "Estonia": {"Continent": "Europe", "Subcontinent": "Northern Europe"},
+    "Finland": {"Continent": "Europe", "Subcontinent": "Northern Europe"},
+    "France": {"Continent": "Europe", "Subcontinent": "Western Europe"},
+    "Germany": {"Continent": "Europe", "Subcontinent": "Western Europe"},
+    "Greece": {"Continent": "Europe", "Subcontinent": "Southern Europe"},
+    "Hungary": {"Continent": "Europe", "Subcontinent": "Eastern Europe"},
+    "Iceland": {"Continent": "Europe", "Subcontinent": "Northern Europe"},
+    "Ireland": {"Continent": "Europe", "Subcontinent": "Northern Europe"},
+    "Italy": {"Continent": "Europe", "Subcontinent": "Southern Europe"},
+    "Latvia": {"Continent": "Europe", "Subcontinent": "Northern Europe"},
+    "Liechtenstein": {"Continent": "Europe", "Subcontinent": "Western Europe"},
+    "Lithuania": {"Continent": "Europe", "Subcontinent": "Northern Europe"},
+    "Luxembourg": {"Continent": "Europe", "Subcontinent": "Western Europe"},
+    "Malta": {"Continent": "Europe", "Subcontinent": "Southern Europe"},
+    "Moldova": {"Continent": "Europe", "Subcontinent": "Eastern Europe"},
+    "Monaco": {"Continent": "Europe", "Subcontinent": "Western Europe"},
+    "Montenegro": {"Continent": "Europe", "Subcontinent": "Southern Europe"},
+    "Netherlands": {"Continent": "Europe", "Subcontinent": "Western Europe"},
+    "North Macedonia": {"Continent": "Europe", "Subcontinent": "Southern Europe"},
+    "Norway": {"Continent": "Europe", "Subcontinent": "Northern Europe"},
+    "Poland": {"Continent": "Europe", "Subcontinent": "Eastern Europe"},
+    "Portugal": {"Continent": "Europe", "Subcontinent": "Southern Europe"},
+    "Romania": {"Continent": "Europe", "Subcontinent": "Eastern Europe"},
+    "San Marino": {"Continent": "Europe", "Subcontinent": "Southern Europe"},
+    "Serbia": {"Continent": "Europe", "Subcontinent": "Southern Europe"},
+    "Slovakia": {"Continent": "Europe", "Subcontinent": "Eastern Europe"},
+    "Slovenia": {"Continent": "Europe", "Subcontinent": "Southern Europe"},
+    "Spain": {"Continent": "Europe", "Subcontinent": "Southern Europe"},
+    "Sweden": {"Continent": "Europe", "Subcontinent": "Northern Europe"},
+    "Switzerland": {"Continent": "Europe", "Subcontinent": "Western Europe"},
+    "Ukraine": {"Continent": "Europe", "Subcontinent": "Eastern Europe"},
+    "United Kingdom": {"Continent": "Europe", "Subcontinent": "Northern Europe"},
+    "Vatican City": {"Continent": "Europe", "Subcontinent": "Southern Europe"},
+
+    # North America (23 countries)
+    "Antigua and Barbuda": {"Continent": "North America", "Subcontinent": "Caribbean"},
+    "Bahamas": {"Continent": "North America", "Subcontinent": "Caribbean"},
+    "Barbados": {"Continent": "North America", "Subcontinent": "Caribbean"},
+    "Belize": {"Continent": "North America", "Subcontinent": "Central America"},
+    "Canada": {"Continent": "North America", "Subcontinent": "Northern America"},
+    "Costa Rica": {"Continent": "North America", "Subcontinent": "Central America"},
+    "Cuba": {"Continent": "North America", "Subcontinent": "Caribbean"},
+    "Dominica": {"Continent": "North America", "Subcontinent": "Caribbean"},
+    "Dominican Republic": {"Continent": "North America", "Subcontinent": "Caribbean"},
+    "El Salvador": {"Continent": "North America", "Subcontinent": "Central America"},
+    "Grenada": {"Continent": "North America", "Subcontinent": "Caribbean"},
+    "Guatemala": {"Continent": "North America", "Subcontinent": "Central America"},
+    "Haiti": {"Continent": "North America", "Subcontinent": "Caribbean"},
+    "Honduras": {"Continent": "North America", "Subcontinent": "Central America"},
+    "Jamaica": {"Continent": "North America", "Subcontinent": "Caribbean"},
+    "Mexico": {"Continent": "North America", "Subcontinent": "Central America"},
+    "Nicaragua": {"Continent": "North America", "Subcontinent": "Central America"},
+    "Panama": {"Continent": "North America", "Subcontinent": "Central America"},
+    "Saint Kitts and Nevis": {"Continent": "North America", "Subcontinent": "Caribbean"},
+    "Saint Lucia": {"Continent": "North America", "Subcontinent": "Caribbean"},
+    "Saint Vincent and the Grenadines": {"Continent": "North America", "Subcontinent": "Caribbean"},
+    "Trinidad and Tobago": {"Continent": "North America", "Subcontinent": "Caribbean"},
+    "United States": {"Continent": "North America", "Subcontinent": "Northern America"},
+
+    # South America (12 countries)
+    "Argentina": {"Continent": "South America", "Subcontinent": "South America"},
+    "Bolivia": {"Continent": "South America", "Subcontinent": "South America"},
+    "Brazil": {"Continent": "South America", "Subcontinent": "South America"},
+    "Chile": {"Continent": "South America", "Subcontinent": "South America"},
+    "Colombia": {"Continent": "South America", "Subcontinent": "South America"},
+    "Ecuador": {"Continent": "South America", "Subcontinent": "South America"},
+    "Guyana": {"Continent": "South America", "Subcontinent": "South America"},
+    "Paraguay": {"Continent": "South America", "Subcontinent": "South America"},
+    "Peru": {"Continent": "South America", "Subcontinent": "South America"},
+    "Suriname": {"Continent": "South America", "Subcontinent": "South America"},
+    "Uruguay": {"Continent": "South America", "Subcontinent": "South America"},
+    "Venezuela": {"Continent": "South America", "Subcontinent": "South America"},
+
+    # Oceania (14 countries)
+    "Australia": {"Continent": "Oceania", "Subcontinent": "Australia and New Zealand"},
+    "Fiji": {"Continent": "Oceania", "Subcontinent": "Melanesia"},
+    "Kiribati": {"Continent": "Oceania", "Subcontinent": "Micronesia"},
+    "Marshall Islands": {"Continent": "Oceania", "Subcontinent": "Micronesia"},
+    "Micronesia": {"Continent": "Oceania", "Subcontinent": "Micronesia"},
+    "Nauru": {"Continent": "Oceania", "Subcontinent": "Micronesia"},
+    "New Zealand": {"Continent": "Oceania", "Subcontinent": "Australia and New Zealand"},
+    "Palau": {"Continent": "Oceania", "Subcontinent": "Micronesia"},
+    "Papua New Guinea": {"Continent": "Oceania", "Subcontinent": "Melanesia"},
+    "Samoa": {"Continent": "Oceania", "Subcontinent": "Polynesia"},
+    "Solomon Islands": {"Continent": "Oceania", "Subcontinent": "Melanesia"},
+    "Tonga": {"Continent": "Oceania", "Subcontinent": "Polynesia"},
+    "Tuvalu": {"Continent": "Oceania", "Subcontinent": "Polynesia"},
+    "Vanuatu": {"Continent": "Oceania", "Subcontinent": "Melanesia"},
+}
+
+ALIASES = {
+    "USA": "United States",
+    "UK": "United Kingdom",
+    "U.K.": "United Kingdom",
+    "U.S.A.": "United States",
+    "DRC": "Democratic Republic of the Congo",
+}
+
+def normalize_country_name(country):
+    """Normalize country names using aliases and lowercase matching"""
+    if pd.isna(country):
+        return None
+        
+    # Convert to string and strip whitespace
+    country = str(country).strip()
+    
+    # Check aliases first
+    if country in ALIASES:
+        return ALIASES[country]
+    
+    # Try case-insensitive matching with COUNTRY_MAPPING
+    country_lower = country.lower()
+    for mapped_country in COUNTRY_MAPPING:
+        if mapped_country.lower() == country_lower:
+            return mapped_country
+    
+    # If no match found, return original (will default to 'Unknown' later)
+    return country
+
+def extract_country(geo_location):
+    """Extract country name from Geographic Location"""
+    if pd.isna(geo_location):
+        return None
+    # Handle cases like "USA: New York" or "United States: California"
+    raw_country = geo_location.split(":")[0].strip()
+    return normalize_country_name(raw_country)
+
+def add_geo_columns(df):
+    """Add Continent and Subcontinent columns based on Geographic Location"""
+    # Extract and normalize country names
+    df['Country'] = df['Geographic Location'].apply(extract_country)
+    
+    # Add continent and subcontinent with case-insensitive matching
+    df['Continent'] = df['Country'].apply(
+        lambda x: COUNTRY_MAPPING.get(x, {}).get('Continent', 'Unknown'))
+    df['Subcontinent'] = df['Country'].apply(
+        lambda x: COUNTRY_MAPPING.get(x, {}).get('Subcontinent', 'Unknown'))
+    
+    # Drop temporary Country column
+    df = df.drop(columns=['Country'], errors='ignore')
+    return df
+
+def filter_dataframe(df, args):
+    """Filter DataFrame based on command line arguments"""
+    if args.host:
+        host_filter = '|'.join(args.host)
+        df = df[df['Host'].str.contains(host_filter, case=False, na=False)]
+    
+    if args.year:
+        # First create Year column, handling invalid dates
+        try:
+            # Try converting to datetime, coercing errors to NaT (Not a Time)
+            df['Year'] = pd.to_datetime(df['Collection Date'], errors='coerce').dt.year
+        except Exception as e:
+            logging.error(f"Error parsing dates: {e}")
+            raise ValueError("Could not parse dates from 'Collection Date' column")
+        
+        # Drop rows where Year couldn't be determined
+        df = df.dropna(subset=['Year'])
+        df['Year'] = df['Year'].astype(int)
+        
+        year_ranges = []
+        for year_arg in args.year:
+            if '-' in year_arg:
+                start, end = year_arg.split('-')
+                year_ranges.append((int(start), int(end)))
+            else:
+                year = int(year_arg)
+                year_ranges.append((year, year))
+        
+        # Apply year filters
+        conditions = []
+        for start, end in year_ranges:
+            conditions.append((df['Year'] >= start) & (df['Year'] <= end))
+        
+        if conditions:
+            combined_condition = conditions[0]
+            for cond in conditions[1:]:
+                combined_condition = combined_condition | cond
+            df = df[combined_condition]
+    
+    if args.country:
+        country_filter = '|'.join(args.country)
+        df = df[df['Geographic Location'].str.contains(country_filter, case=False, na=False)]
+
+    if args.cont:
+        cont_filter = '|'.join(args.cont)
+        df = df[df['Continent'].str.contains(cont_filter, case=False, na=False)]    
+
+    if args.subcont:
+        subcont_filter = '|'.join(args.subcont)
+        df = df[df['Subcontinent'].str.contains(subcont_filter, case=False, na=False)]
+        
+    return df
+
 def download_genome_fasta_ftp(assembly_accession: str, assembly_name: str, output_folder: str) -> None:
     """Download genome FASTA file via FTP."""
     base_url = "https://ftp.ncbi.nlm.nih.gov/genomes/all"
@@ -358,7 +684,6 @@ def download_genome_fasta_ftp(assembly_accession: str, assembly_name: str, outpu
         logging.error(f"Error downloading genome FASTA for {assembly_accession}: {e}")
 
 
-
 def main():
     """Main function to execute the script."""
     parser = argparse.ArgumentParser(description="Metadata")
@@ -367,6 +692,11 @@ def main():
     parser.add_argument("--sleep", type=float, default=0.5, help="Time to wait between requests (default: 0.5s)")
     parser.add_argument("--checkm", type=float, default=95, help="Minimum CheckM completeness threshold (default: 95)")
     parser.add_argument("--seq", action="store_true", help="Run the script to download sequences")
+    parser.add_argument('--host', nargs='+', help='Filter by host species (e.g., "Homo sapiens" "Bos taurus")')
+    parser.add_argument('--year', nargs='+', help='Filter by year or year range (e.g., "2015" "2018-2025")')
+    parser.add_argument('--country', nargs='+', help='Filter by country (e.g., "Bangladesh" "United States")')
+    parser.add_argument('--cont', nargs='+', help='Filter by countinent (e.g., "Asia" "Africa")')
+    parser.add_argument('--subcont', nargs='+', help='Filter by subcontinent (e.g., "Southern Asia" "Western Africa")')
     args = parser.parse_args()
 
     try:
@@ -413,6 +743,12 @@ def main():
         #save assembly summary
         output_file = os.path.join(metadata_folder, "assembly_summary.csv")
         generate_assembly_summary(df2, output_file)
+        
+        # Generate distribution plots for assembly columns
+        for column in ["Assembly Stats Total Sequence Length"]:
+            df2.loc[:, column] = pd.to_numeric(df2[column], errors="coerce")
+            if not df2[column].empty:
+                plot_distribution(column, df2[column], column, figures_folder)
 
         # Generate and save bar plots
         for variable in ["Geographic Location", "Host", "Collection Date"]:
@@ -436,8 +772,18 @@ def main():
         df3_filtered["Collection Date"] = pd.to_numeric(df3_filtered["Collection Date"], errors="coerce")
         df3_filtered = df3_filtered.dropna(subset=["Collection Date"])
         df3_filtered = df3_filtered.sort_values(by="Collection Date", ascending=True)
+        df2_clean = df2[["Collection Date", "Assembly Stats Total Sequence Length"]].dropna()
 
         # Generate scatter plots with trend lines
+        plot_scatter_with_trend_and_corr(
+            x=df2_clean["Collection Date"],
+            y=df2_clean["Assembly Stats Total Sequence Length"],
+            xlabel="Collection Date",
+            ylabel="Total Sequence Length",
+            title="Scatter Plot: Total Sequence Length vs Collection Date",
+            filename="scatter_plot_total_sequence_length_vs_collection_date.tiff",
+            figures_folder=figures_folder
+        )
         plot_scatter_with_trend_and_corr(
             x=df3_filtered["Collection Date"],
             y=df3_filtered["Annotation Count Gene Total"],
@@ -463,35 +809,63 @@ def main():
             "Organism Infraspecific Names Strain", "Assembly Stats Total Sequence Length",
             "Isolation Source", "Collection Date", "Geographic Location", "Host"
         ]
-        # Filter df2 with selected columns
+        # Modify your existing code:
         df4 = df2[columns_to_keep]
+        df4 = add_geo_columns(df4)  # Add the new columns
         clean_data_file = os.path.join(metadata_folder, "ncbi_clean.csv")
-        save_clean_data(df4, columns_to_keep, clean_data_file)
-        
-        # If --seq is provided, download sequences
-        # Define the input file path inside the metadata folder
-        input_file = os.path.join(metadata_folder, "ncbi_clean.csv")
+        save_clean_data(df4, columns_to_keep + ['Continent', 'Subcontinent'], clean_data_file)
 
-        # Check if the input file exists
+        # Generate and save bar plots for Continent and Subcontinent
+        for variable in ["Continent", "Subcontinent"]:
+            frequency = df4[variable].value_counts()
+            percentage = (frequency / frequency.sum()) * 100
+            plot_bar_charts(variable, frequency, percentage, figures_folder)
+        
+        # Check if --seq argument is provided
+        if not args.seq:
+            print("Please use the --seq argument to download the sequences")
+            exit()
+
+        input_file = os.path.join(metadata_folder, "ncbi_clean.csv")
+        filtered_file = os.path.join(metadata_folder, "ncbi_filtered.csv")
+        
         if not os.path.isfile(input_file):
             logging.error(f"Input file not found at: {input_file}")
             raise FileNotFoundError(f"Input file not found at: {input_file}")
 
-        # Load the CSV file into a DataFrame
         df_clean = pd.read_csv(input_file)
 
-        # Check if required columns exist
-        if "Assembly Accession" not in df_clean.columns or "Assembly Name" not in df_clean.columns:
-            raise ValueError("Required columns 'Assembly Accession' or 'Assembly Name' not found in the CSV file.")
+        required_columns = {"Assembly Accession", "Assembly Name", "Host", "Collection Date", "Geographic Location", "Continent", "Subcontinent"}
+        if not required_columns.issubset(df_clean.columns):
+            missing = required_columns - set(df_clean.columns)
+            raise ValueError(f"Required columns {missing} not found in the CSV file.")
 
-        # Download genome FASTA files for each assembly accession
-        for index, row in tqdm(df_clean.iterrows(), total=len(df_clean), desc="Downloading genome FASTA files"):
+        # Apply filters if any were provided
+        if args.host or args.year or args.country or args.cont or args.subcont:
+            df_filtered = filter_dataframe(df_clean, args)
+            logging.info(f"Filtered to {len(df_filtered)} records based on provided criteria")
+            
+            # Save filtered dataframe
+            df_filtered.to_csv(filtered_file, index=False)
+            logging.info(f"Saved filtered data to: {filtered_file}")
+        else:
+            df_filtered = df_clean
+            logging.info("No filters provided, using all available records")
+
+        if len(df_filtered) == 0:
+            logging.error("No records match the filtering criteria")
+            exit()
+
+        # Download genome FASTA files
+        for index, row in tqdm(df_filtered.iterrows(), total=len(df_filtered), 
+                              desc="Downloading genome FASTA files"):
             assembly_accession = row["Assembly Accession"]
             assembly_name = row["Assembly Name"]
             download_genome_fasta_ftp(assembly_accession, assembly_name, sequence_folder)
 
-        logging.info("Sequence downloading completed.")
+        logging.info(f"Sequence downloading completed. Downloaded {len(df_filtered)} sequences.")
         logging.info("Script completed successfully.")
+
     except Exception as e:
         logging.error(f"Script failed: {e}")
 
