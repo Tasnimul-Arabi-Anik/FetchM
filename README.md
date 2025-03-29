@@ -7,22 +7,26 @@ FetchM is a Python-based tool for fetching and analyzing genomic metadata from N
 - Fetch metadata from NCBI BioSample API.
 - Filter genomes based on CheckM completeness and ANI check status.
 - Generate metadata summaries and annotation statistics.
-- Create various visualizations for geographic distribution, collection dates, and gene counts.
+- Create various visualizations for geographic distribution, collection dates, gene counts, continent, and subcontinent.
 - Download genome sequences (optional).
+- Download sequences after filtering by host species, year, country, continent, and subcontinent.
 
 ## Installation
-### Using Conda
-You can install FetchM in a Conda environment:
+
+### Option 1: Install via Conda (Recommended)
 ```bash
-conda create -n fetchM_env python=3.8
-conda activate fetchM_env
-conda create -n fetchM_env -c conda-forge python=3.8 pandas requests xmltodict matplotlib seaborn scipy tqdm
+conda install -c conda-forge fetchM
 ```
 
-### Using pip
-Ensure you have Python 3 installed. Install dependencies with:
+### Option 2: Install in a New Conda Environment (Isolated)
 ```bash
-pip install -r requirements.txt
+conda create -n fetchM_env -c conda-forge fetchM
+conda activate fetchM_env
+```
+
+### Option 3: Install via pip
+```bash
+pip install fetchM
 ```
 
 ## Usage
@@ -32,14 +36,45 @@ fetchM --input input.tsv --outdir results/
 ```
 
 ### Additional Options:
-- `--checkm 95` (Set CheckM completeness threshold, default: 95)
+- `--checkm CHECKM` (Minimum CheckM completeness threshold, default: 95)
+- `--sleep` (Time to wait between requests, default: 0.5s)
 - `--seq` (Enable sequence download mode)
 
+Downloading sequences based on different criteria
+- `--host HOST [HOST ...]` (Filter by host species, e.g., `"Homo sapiens" "Bos taurus"`)
+- `--year YEAR [YEAR ...]` (Filter by year or year range, e.g., `"2015" "2018-2025"`)
+- `--country COUNTRY [COUNTRY ...]` (Filter by country, e.g., `"Bangladesh" "United States"`)
+- `--cont CONT [CONT ...]` (Filter by continent, e.g., `"Asia" "Africa"`)
+- `--subcont SUBCONT [SUBCONT ...]` (Filter by subcontinent, e.g., `"Southern Asia" "Western Africa"`)
+
+## Input 
+Download the ncbi_dataset.tsv from NCBI genome database for your target organism
+-**ncbi_dataset.tsv**
+
 ## Output
-FetchM creates multiple output files inside the `results/` directory:
+FetchM creates a subdirectory in `/results/` based on the organism name provided in the input file. Inside this subdirectory, the following folders are created:
 - **Metadata summaries** in `metadata_output/`
+  - `annotation_summary.csv`
+  - `assembly_summary.csv`
+  - `metadata_summary.csv`
+  - `ncbi_clean.csv`
+  - `ncbi_filtered.csv`
+  - `ncbi_dataset_updated.tsv`
 - **Figures** in `figures/`
-- **Filtered datasets** for further analysis
+  - `Annotation Count Gene Protein-coding_distribution.tiff`
+  - `Annotation Count Gene Pseudogene_distribution.tiff`
+  - `Annotation Count Gene Total_distribution.tiff`
+  - `Assembly Stats Total Sequence Length_distribution.tiff`
+  - `Collection Date_bar_plots.tiff`
+  - `Continent_bar_plots.tiff`
+  - `Geographic Location_bar_plots.tiff`
+  - `Host_bar_plots.tiff`
+  - `scatter_plot_gene_protein_coding_vs_collection_date.tiff`
+  - `scatter_plot_gene_total_vs_collection_date.tiff`
+  - `scatter_plot_total_sequence_length_vs_collection_date.tiff`
+  - `Subcontinent_bar_plots.tiff`
+- **Sequences** in `sequences/` (if `--seq` is enabled, it will contain the downloaded genome sequences).
+
 
 ## Visualizations
 ### Annotation Distributions
@@ -54,6 +89,8 @@ FetchM creates multiple output files inside the `results/` directory:
 ![Collection Date Distribution](figures/Collection%20Date_bar_plots.png)
 ![Geographic Location Distribution](figures/Geographic%20Location_bar_plots.png)
 ![Host Distribution](figures/Host_bar_plots.png)
+![Continent Distribution](figures/Continent_bar_plots.png)
+![Subcontinent Distribution](figures/Subcontinent_bar_plots.png)
 
 ### Scatter Plots
 ![Gene Protein Coding vs Collection Date](figures/scatter_plot_gene_protein_coding_vs_collection_date.png)
