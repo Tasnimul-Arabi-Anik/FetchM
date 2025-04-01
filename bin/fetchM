@@ -555,6 +555,7 @@ COUNTRY_MAPPING = {
 
 ALIASES = {
     "USA": "United States",
+    "Korea": "North Korea",
     "UK": "United Kingdom",
     "U.K.": "United Kingdom",
     "U.S.A.": "United States",
@@ -715,7 +716,7 @@ def main():
         df["Host"] = pd.NA
 
         for index, row in tqdm(df.iterrows(), total=len(df), desc="Fetching metadata"):
-            biosample_id = row["BioSample"]
+            biosample_id = row["Assembly BioSample Accession"]
             if pd.notna(biosample_id):
                 isolation_source, collection_date, geo_location, host = fetch_metadata(biosample_id, args.sleep)
                 df.at[index, "Isolation Source"] = isolation_source
@@ -805,7 +806,7 @@ def main():
 
         # Save clean data
         columns_to_keep = [
-            "Organism Name", "BioSample", "Assembly Accession", "Assembly Name", "Assembly BioProject Accession",
+            "Organism Name", "Assembly BioSample Accession", "Assembly Accession", "Assembly Name", "Assembly BioProject Accession",
             "Organism Infraspecific Names Strain", "Assembly Stats Total Sequence Length",
             "Isolation Source", "Collection Date", "Geographic Location", "Host"
         ]
