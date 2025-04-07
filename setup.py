@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name="fetchM",
-    version="0.1.3",
+    version="0.1.5",
     author="Tasnimul Arabi Anik",
     author_email="arabianik987@gmail.com",
     description="A Python tool for fetching metadata for bacterial genomes.",
@@ -17,7 +17,9 @@ setup(
         "matplotlib",
         "seaborn",
         "scipy",
-        "tqdm"
+        "tqdm",
+        "plotly",
+        "kaleido"
     ],
     classifiers=[
         "Programming Language :: Python :: 3",

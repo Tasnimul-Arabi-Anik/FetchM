@@ -6,4 +6,6 @@ seaborn
 scipy
 tqdm
 argparse
+plotly
+kaleido
 

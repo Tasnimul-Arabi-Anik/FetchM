@@ -12,6 +12,8 @@ import argparse
 from tqdm import tqdm
 import logging
 from typing import Tuple, Dict, Optional, List
+import plotly.express as px
+import plotly.io as pio
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -37,15 +39,19 @@ def load_data(input_file: str) -> pd.DataFrame:
         raise
 
 
-def filter_data(df: pd.DataFrame, checkm_threshold: float) -> pd.DataFrame:
+def filter_data(df: pd.DataFrame, checkm_threshold: float, ani_status_list: list) -> pd.DataFrame:
     """Filter the DataFrame based on CheckM completeness and ANI Check status."""
     try:
         filtered_df = df[
             df["CheckM completeness"].notna() &
-            (df["CheckM completeness"] > checkm_threshold) &
-            (df["ANI Check status"] == "OK")
+            (df["CheckM completeness"] > checkm_threshold)
         ]
-        logging.info(f"Data filtered with CheckM threshold {checkm_threshold}")
+
+        # Only apply ANI filtering if 'all' is not in the list
+        if "all" not in ani_status_list:
+            filtered_df = filtered_df[filtered_df["ANI Check status"].isin(ani_status_list)]
+
+        logging.info(f"Data filtered with CheckM threshold {checkm_threshold} and ANI status {ani_status_list}")
         return filtered_df
     except Exception as e:
         logging.error(f"Error filtering data: {e}")
@@ -193,6 +199,33 @@ def plot_bar_charts(variable: str, frequency: pd.Series, percentage: pd.Series, 
         logging.error(f"Error generating bar plots for {variable}: {e}")
         raise
 
+def plot_geo_choropleth(variable: str, frequency: pd.Series, figures_folder: str) -> None:
+    """Generate and save a choropleth map for a given geographic variable."""
+    try:
+        # Create a DataFrame for mapping
+        map_df = frequency.reset_index()
+        map_df.columns = [variable, 'Frequency']
+
+        # Generate choropleth
+        fig = px.choropleth(
+            map_df,
+            locations=variable,
+            locationmode="country names",  # or "ISO-3" if you have 3-letter codes
+            color="Frequency",
+            color_continuous_scale="Viridis",
+            title=f"Distribution of {variable}",
+            template="plotly_white"
+        )
+
+        # Save as static image (TIFF)
+        figure_path = os.path.join(figures_folder, f"{variable}_map.jpg")
+        pio.write_image(fig, figure_path, format="jpg", scale=3)  # requires kaleido installed
+
+        logging.info(f"Map plot saved for {variable}")
+    except Exception as e:
+        logging.error(f"Error generating map plot for {variable}: {e}")
+        raise
+
 
 def plot_distribution(column: str, data: pd.Series, title: str, figures_folder: str) -> None:
     """Generate and save a distribution plot."""
@@ -219,11 +252,10 @@ def plot_scatter_with_trend_and_corr(
     try:
         plt.figure(figsize=(10, 6))
 
-        # Ensure x and y are numeric
-        x_numeric = pd.to_numeric(x, errors="coerce")
+        # Convert x (years) to categorical but keep numeric for regression
+        x_numeric = pd.to_numeric(x, errors="coerce").round().astype('Int64')
         y_numeric = pd.to_numeric(y, errors="coerce")
         
-        # Create a DataFrame and drop NA values
         plot_data = pd.DataFrame({'x': x_numeric, 'y': y_numeric}).dropna()
         
         if len(plot_data) == 0:
@@ -234,13 +266,19 @@ def plot_scatter_with_trend_and_corr(
             logging.error(f"Data length mismatch for {title}: x={len(plot_data['x'])}, y={len(plot_data['y'])}")
             return
 
-        # Compute Pearson correlation coefficient
+        # Compute correlation
         r_value, p_value = stats.pearsonr(plot_data['x'], plot_data['y'])
 
-        # Scatter plot with regression line
-        sns.regplot(x=plot_data['x'], y=plot_data['y'], scatter_kws={"alpha": 0.5}, line_kws={"color": "red"})
+        # Plot with year-formatted x-axis
+        sns.regplot(x=plot_data['x'], y=plot_data['y'], 
+                    scatter_kws={"alpha": 0.5}, 
+                    line_kws={"color": "red"})
+        
+        # Force integer ticks for years
+        plt.gca().xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+        plt.xticks(rotation=90)  # Improve readability
 
-        # Annotate with correlation coefficient
+        # Annotation
         plt.text(
             plot_data['x'].min(), plot_data['y'].max(),
             f"r = {r_value:.3f} (p={p_value:.3f})",
@@ -251,6 +289,7 @@ def plot_scatter_with_trend_and_corr(
         plt.xlabel(xlabel)
         plt.ylabel(ylabel)
         plt.tight_layout()
+        
         figure_path = os.path.join(figures_folder, filename)
         plt.savefig(figure_path, format="tiff", dpi=300)
         plt.close()
@@ -654,9 +693,9 @@ def filter_dataframe(df, args):
         df = df[df['Continent'].str.contains(cont_filter, case=False, na=False)]    
 
     if args.subcont:
-        subcont_filter = '|'.join(args.subcont)
-        df = df[df['Subcontinent'].str.contains(subcont_filter, case=False, na=False)]
-        
+    # Normalize input for consistent matching
+        subcont_filter = [s.strip().lower() for s in args.subcont]
+        df = df[df['Subcontinent'].str.lower().isin(subcont_filter)]     
     return df
 
 def download_genome_fasta_ftp(assembly_accession: str, assembly_name: str, output_folder: str) -> None:
@@ -691,6 +730,8 @@ def main():
     parser.add_argument("--input", required=True, help="Path to the input TSV file")
     parser.add_argument("--outdir", required=True, help="Path to the output directory")
     parser.add_argument("--sleep", type=float, default=0.5, help="Time to wait between requests (default: 0.5s)")
+    parser.add_argument("--ani", nargs='+', choices=['OK', 'Inconclusive', 'Failed', 'all'], default=['OK'],
+    help="Filter genomes by ANI status. Choices: OK, Inconclusive, Failed, all. Default is OK.")   
     parser.add_argument("--checkm", type=float, default=95, help="Minimum CheckM completeness threshold (default: 95)")
     parser.add_argument("--seq", action="store_true", help="Run the script to download sequences")
     parser.add_argument('--host', nargs='+', help='Filter by host species (e.g., "Homo sapiens" "Bos taurus")')
@@ -703,7 +744,7 @@ def main():
     try:
         # Load and filter data
         df = load_data(args.input)
-        df = filter_data(df, args.checkm)
+        df = filter_data(df, args.checkm, args.ani)
 
         # Create output directories
         organism_name = df["Organism Name"].iloc[0].replace(" ", "_")
@@ -756,6 +797,11 @@ def main():
             frequency = df2[variable].value_counts()
             percentage = (frequency / frequency.sum()) * 100
             plot_bar_charts(variable, frequency, percentage, figures_folder)
+        
+        #Save map plots
+        for variable in ["Geographic Location"]:
+            frequency = df2[variable].value_counts()
+            plot_geo_choropleth(variable, frequency, figures_folder)
 
         #save annotation summary
         df3 = df[df["Annotation Name"] == "NCBI Prokaryotic Genome Annotation Pipeline (PGAP)"]

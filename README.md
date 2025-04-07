@@ -12,20 +12,10 @@ FetchM is a Python-based tool for fetching and analyzing genomic metadata from N
 - Download sequences after filtering by host species, year, country, continent, and subcontinent.
 
 ## Installation
-
-### Option 1: Install via Conda (Recommended)
+### Install in a New Conda Environment 
 ```bash
-conda install -c conda-forge fetchM
-```
-
-### Option 2: Install in a New Conda Environment (Isolated)
-```bash
-conda create -n fetchM_env -c conda-forge fetchM
-conda activate fetchM_env
-```
-
-### Option 3: Install via pip
-```bash
+conda create -n fetchm python=3.9
+conda activate fetchm
 pip install fetchM
 ```
 
@@ -34,9 +24,19 @@ Run FetchM with the following command:
 ```bash
 fetchM --input input.tsv --outdir results/
 ```
+For retrieving all available sequence data
+```bash
+fetchM --input input.tsv --outdir results/ --checkm 0 --ani all
+```
+For downloading sequences with sequence information
+```bash
+fetchM --input input.tsv --outdir results/ --seq
+```
+For downloading filtered sequences add the available Options below:
 
-### Additional Options:
+### Options:
 - `--checkm CHECKM` (Minimum CheckM completeness threshold, default: 95)
+- `--ani` (Filter genomes by ANI status. Choices: OK, Inconclusive, Failed, all. Default is OK)
 - `--sleep` (Time to wait between requests, default: 0.5s)
 - `--seq` (Enable sequence download mode)
 
@@ -47,9 +47,41 @@ Downloading sequences based on different criteria
 - `--cont CONT [CONT ...]` (Filter by continent, e.g., `"Asia" "Africa"`)
 - `--subcont SUBCONT [SUBCONT ...]` (Filter by subcontinent, e.g., `"Southern Asia" "Western Africa"`)
 
-## Input 
-Download the ncbi_dataset.tsv from NCBI genome database for your target organism
+## Input
+Download ncbi_dataset.tsv of your target organism(s) from the [NCBI genome database](https://www.ncbi.nlm.nih.gov/datasets/genome/).
 -**ncbi_dataset.tsv**
+
+# 📋 Required Columns for `ncbi_dataset.tsv` in FetchM
+
+Before running **FetchM**, ensure that your `ncbi_dataset.tsv` file includes the following columns. These columns are necessary for metadata enrichment, quality filtering, and downstream analysis.
+
+---
+
+## 🧬 Required Columns
+
+| Column Name                                | Description |
+|--------------------------------------------|-------------|
+| `Assembly Accession`                       | Unique identifier for the assembly |
+| `Assembly Name`                            | Name of the genome assembly |
+| `Organism Name`                            | Scientific name of the organism |
+| `ANI Check status`                         | Status of Average Nucleotide Identity (ANI) check |
+| `Annotation Name`                          | Annotation version or label used |
+| `Assembly Stats Total Sequence Length`     | Total length (in base pairs) of all sequences in the assembly |
+| `Assembly BioProject Accession`            | Accession ID for the related BioProject |
+| `Assembly BioSample Accession`             | Accession ID for the related BioSample |
+| `Annotation Count Gene Total`              | Total number of genes annotated |
+| `Annotation Count Gene Protein-coding`     | Number of protein-coding genes |
+| `Annotation Count Gene Pseudogene`         | Number of pseudogenes |
+| `CheckM completeness`                      | Completeness score from CheckM (in %) |
+| `CheckM contamination`                     | Contamination score from CheckM (in %) |
+
+---
+
+## ✅ Tips
+
+- The file must be **tab-separated** (`.tsv` format).
+- Don't change Column headers 
+---
 
 ## Output
 FetchM creates a subdirectory in `/results/` based on the organism name provided in the input file. Inside this subdirectory, the following folders are created:
@@ -68,6 +100,7 @@ FetchM creates a subdirectory in `/results/` based on the organism name provided
   - `Collection Date_bar_plots.tiff`
   - `Continent_bar_plots.tiff`
   - `Geographic Location_bar_plots.tiff`
+  - `Geographic Location_map.jpg`
   - `Host_bar_plots.tiff`
   - `scatter_plot_gene_protein_coding_vs_collection_date.tiff`
   - `scatter_plot_gene_total_vs_collection_date.tiff`
@@ -87,6 +120,7 @@ FetchM creates a subdirectory in `/results/` based on the organism name provided
 
 ### Metadata Summaries
 ![Collection Date Distribution](figures/Collection%20Date_bar_plots.png)
+![Geographic Location Map](figures/Geographic%20Location_map.jpg)
 ![Geographic Location Distribution](figures/Geographic%20Location_bar_plots.png)
 ![Host Distribution](figures/Host_bar_plots.png)
 ![Continent Distribution](figures/Continent_bar_plots.png)
