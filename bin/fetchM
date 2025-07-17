@@ -7,6 +7,7 @@ import time
 import matplotlib.pyplot as plt
 import os
 import seaborn as sns
+import numpy as np
 import scipy.stats as stats
 import argparse
 from tqdm import tqdm
@@ -42,20 +43,26 @@ def load_data(input_file: str) -> pd.DataFrame:
 def filter_data(df: pd.DataFrame, checkm_threshold: float, ani_status_list: list) -> pd.DataFrame:
     """Filter the DataFrame based on CheckM completeness and ANI Check status."""
     try:
-        filtered_df = df[
-            df["CheckM completeness"].notna() &
-            (df["CheckM completeness"] > checkm_threshold)
-        ]
+        filtered_df = df
 
-        # Only apply ANI filtering if 'all' is not in the list
+        # Apply CheckM filtering only if threshold is provided
+        if checkm_threshold is not None:
+            filtered_df = filtered_df[
+                filtered_df["CheckM completeness"].notna() &
+                (filtered_df["CheckM completeness"] > checkm_threshold)
+            ]
+
+        # Apply ANI filtering only if 'all' is not in the list
         if "all" not in ani_status_list:
             filtered_df = filtered_df[filtered_df["ANI Check status"].isin(ani_status_list)]
 
         logging.info(f"Data filtered with CheckM threshold {checkm_threshold} and ANI status {ani_status_list}")
         return filtered_df
+
     except Exception as e:
         logging.error(f"Error filtering data: {e}")
         raise
+
 
 
 def create_output_directory(output_directory: str, organism_name: str) -> Tuple[str, str, str, str]:
@@ -129,22 +136,37 @@ def fetch_metadata(biosample_id: str, sleep_time: float) -> Tuple:
 
 def standardize_date(date: str) -> str:
     """Standardize the 'Collection Date' column."""
-    if pd.isna(date) or date in ["unknown", "missing", "NA", "not collected"]:
+    if pd.isna(date):
         return "absent"
+    
+    cleaned = str(date).strip().lower()
+    if cleaned in [
+        "unknown", "missing", "na", "n/a", "none", "absent",
+        "not collected", "not applicable", "no date", "no date information",
+        "no date data", "no date specified", "not specified", "not provided", "provided"
+    ]:
+        return "absent"
+    
     try:
         year = str(date).split("-")[0]
-        if year.isdigit() and len(year) == 4:
-            return year
-        else:
-            return "absent"
+        return year if year.isdigit() and len(year) == 4 else "absent"
     except:
         return "absent"
 
 
 def standardize_location(location: str) -> str:
     """Standardize the 'Geographic Location' column."""
-    if pd.isna(location) or location.lower() in ["missing", "unknown", "not applicable", "not collected"]:
+    if pd.isna(location):
         return "absent"
+    
+    cleaned = location.strip().lower()
+    if cleaned in [
+        "missing", "unknown", "na", "n/a", "none", "absent", "provided",
+        "not collected", "not applicable", "no location", "no location information",
+        "no location data", "no location specified", "not specified", "not provided"
+    ]:
+        return "absent"
+    
     try:
         country = location.split(":")[0].strip()
         return country
@@ -154,8 +176,17 @@ def standardize_location(location: str) -> str:
 
 def standardize_host(host: str) -> str:
     """Standardize the 'Host' column."""
-    if pd.isna(host) or host in ["unknown", "missing", "not applicable", "not collected", ""]:
+    if pd.isna(host):
         return "absent"
+    
+    cleaned = host.strip().lower()
+    if cleaned in [
+        "unknown", "missing", "na", "n/a", "none", "absent", "provided",
+        "not collected", "not applicable", "no host", "no host information",
+        "no host data", "no host specified", "not specified", "not provided"
+    ]:
+        return "absent"
+    
     return host
 
 
@@ -170,9 +201,15 @@ def save_summary(df: pd.DataFrame, output_file: str) -> None:
 
 
 def plot_bar_charts(variable: str, frequency: pd.Series, percentage: pd.Series, figures_folder: str) -> None:
-    """Generate and save bar plots for a given variable."""
+    """Generate and save bar plots for a given variable with dynamic width."""
     try:
-        plt.figure(figsize=(12, 6))
+        num_categories = len(frequency)
+        width_per_category = 0.4  # adjust this factor as needed
+        min_width = 10
+        max_width = 30
+        fig_width = min(max(num_categories * width_per_category, min_width), max_width)
+
+        plt.figure(figsize=(fig_width, 6))
 
         # Frequency plot
         plt.subplot(1, 2, 1)
@@ -199,29 +236,56 @@ def plot_bar_charts(variable: str, frequency: pd.Series, percentage: pd.Series, 
         logging.error(f"Error generating bar plots for {variable}: {e}")
         raise
 
+
 def plot_geo_choropleth(variable: str, frequency: pd.Series, figures_folder: str) -> None:
     """Generate and save a choropleth map for a given geographic variable."""
     try:
-        # Create a DataFrame for mapping
+        # Create DataFrame
         map_df = frequency.reset_index()
         map_df.columns = [variable, 'Frequency']
+
+        # Create hover text
+        map_df['hover'] = map_df.apply(
+            lambda row: f"{row[variable]}<br>Count: {row['Frequency']}", axis=1
+        )
 
         # Generate choropleth
         fig = px.choropleth(
             map_df,
             locations=variable,
-            locationmode="country names",  # or "ISO-3" if you have 3-letter codes
+            locationmode="country names",
             color="Frequency",
-            color_continuous_scale="Viridis",
-            title=f"Distribution of {variable}",
+            hover_name=variable,
+            hover_data={"Frequency": True},
+            color_continuous_scale="Blues",
+            title=f"Geographic Distribution",
             template="plotly_white"
         )
 
-        # Save as static image (TIFF)
+        # Update layout for improved appearance
+        fig.update_layout(
+            geo=dict(
+                projection_type="natural earth",  # better projection
+                showframe=False,
+                showcoastlines=True,
+                coastlinecolor="gray",
+                landcolor="white",
+                showcountries=True,
+                countrycolor="black"
+            ),
+            coloraxis_colorbar=dict(
+                title="Record Count",
+                ticks="outside"
+            ),
+            margin=dict(l=20, r=20, t=60, b=20)
+        )
+
+        # Save as high-resolution image
         figure_path = os.path.join(figures_folder, f"{variable}_map.jpg")
-        pio.write_image(fig, figure_path, format="jpg", scale=3)  # requires kaleido installed
+        pio.write_image(fig, figure_path, format="jpg", scale=4)
 
         logging.info(f"Map plot saved for {variable}")
+
     except Exception as e:
         logging.error(f"Error generating map plot for {variable}: {e}")
         raise
@@ -252,48 +316,72 @@ def plot_scatter_with_trend_and_corr(
     try:
         plt.figure(figsize=(10, 6))
 
-        # Convert x (years) to categorical but keep numeric for regression
         x_numeric = pd.to_numeric(x, errors="coerce").round().astype('Int64')
         y_numeric = pd.to_numeric(y, errors="coerce")
-        
+
         plot_data = pd.DataFrame({'x': x_numeric, 'y': y_numeric}).dropna()
-        
+
         if len(plot_data) == 0:
             logging.warning(f"No valid data points for {title}")
             return
-            
-        if len(plot_data['x']) != len(plot_data['y']):
-            logging.error(f"Data length mismatch for {title}: x={len(plot_data['x'])}, y={len(plot_data['y'])}")
+
+        # Outlier removal (z-score >3)
+        # IQR-based outlier removal based only on x-axis
+        Q1 = plot_data['x'].quantile(0.25)
+        Q3 = plot_data['x'].quantile(0.75)
+        IQR = Q3 - Q1
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
+
+        filtered_data = plot_data[(plot_data['x'] >= lower_bound) & (plot_data['x'] <= upper_bound)]
+
+        if len(filtered_data) == 0:
+            logging.warning(f"All data points were x-outliers (IQR method) for {title}")
             return
 
-        # Compute correlation
-        r_value, p_value = stats.pearsonr(plot_data['x'], plot_data['y'])
+        # Correlations
+        pearson_r, pearson_p = stats.pearsonr(filtered_data['x'], filtered_data['y'])
+        spearman_r, spearman_p = stats.spearmanr(filtered_data['x'], filtered_data['y'])
 
-        # Plot with year-formatted x-axis
-        sns.regplot(x=plot_data['x'], y=plot_data['y'], 
-                    scatter_kws={"alpha": 0.5}, 
-                    line_kws={"color": "red"})
-        
-        # Force integer ticks for years
+        # Plot
+        sns.regplot(
+            x=filtered_data['x'],
+            y=filtered_data['y'],
+            scatter_kws={"alpha": 0.5, "s": 40},
+            line_kws={"color": "red"}
+        )
         plt.gca().xaxis.set_major_locator(plt.MaxNLocator(integer=True))
-        plt.xticks(rotation=90)  # Improve readability
+        plt.xticks(rotation=90)
+        plt.grid(True, linestyle='--', alpha=0.5)
+
+        p_text = lambda p: "< 0.001" if p < 0.001 else f"{p:.3f}"
 
         # Annotation
+        annotation_text = (
+            f"Pearson r = {pearson_r:.3f} (p={p_text(pearson_p)})\n"
+            f"Spearman ρ = {spearman_r:.3f} (p={p_text(spearman_p)})"
+            )
+        y_pos = filtered_data['y'].max() - 0.1 * (filtered_data['y'].max() - filtered_data['y'].min())
+
         plt.text(
-            plot_data['x'].min(), plot_data['y'].max(),
-            f"r = {r_value:.3f} (p={p_value:.3f})",
-            fontsize=12, color="black", bbox=dict(facecolor="white", alpha=0.7)
+            filtered_data['x'].min(),
+            y_pos,
+            annotation_text,
+            fontsize=11,
+            color="black",
+            bbox=dict(facecolor="white", alpha=0.7)
         )
 
         plt.title(title)
         plt.xlabel(xlabel)
         plt.ylabel(ylabel)
         plt.tight_layout()
-        
+
         figure_path = os.path.join(figures_folder, filename)
         plt.savefig(figure_path, format="tiff", dpi=300)
         plt.close()
         logging.info(f"Scatter plot saved: {title}")
+
     except Exception as e:
         logging.error(f"Error generating scatter plot for {title}: {e}")
         raise
@@ -419,6 +507,7 @@ COUNTRY_MAPPING = {
     "Mali": {"Continent": "Africa", "Subcontinent": "Western Africa"},
     "Mauritania": {"Continent": "Africa", "Subcontinent": "Western Africa"},
     "Mauritius": {"Continent": "Africa", "Subcontinent": "Eastern Africa"},
+    "Mayotte": {"Continent": "Africa", "Subcontinent": "Eastern Africa"},
     "Morocco": {"Continent": "Africa", "Subcontinent": "Northern Africa"},
     "Mozambique": {"Continent": "Africa", "Subcontinent": "Eastern Africa"},
     "Namibia": {"Continent": "Africa", "Subcontinent": "Southern Africa"},
@@ -501,6 +590,7 @@ COUNTRY_MAPPING = {
     "Bulgaria": {"Continent": "Europe", "Subcontinent": "Eastern Europe"},
     "Croatia": {"Continent": "Europe", "Subcontinent": "Southern Europe"},
     "Czech Republic": {"Continent": "Europe", "Subcontinent": "Eastern Europe"},
+    "Czechoslovakia": {"Continent": "Europe", "Subcontinent": "Eastern Europe"},
     "Denmark": {"Continent": "Europe", "Subcontinent": "Northern Europe"},
     "Estonia": {"Continent": "Europe", "Subcontinent": "Northern Europe"},
     "Finland": {"Continent": "Europe", "Subcontinent": "Northern Europe"},
@@ -594,11 +684,15 @@ COUNTRY_MAPPING = {
 
 ALIASES = {
     "USA": "United States",
+    "USSR": "Northern Asia",
     "Korea": "North Korea",
     "UK": "United Kingdom",
     "U.K.": "United Kingdom",
+    "U.S.": "United States",
     "U.S.A.": "United States",
+    "Viet Nam": "Vietnam",
     "DRC": "Democratic Republic of the Congo",
+
 }
 
 def normalize_country_name(country):
@@ -732,7 +826,8 @@ def main():
     parser.add_argument("--sleep", type=float, default=0.5, help="Time to wait between requests (default: 0.5s)")
     parser.add_argument("--ani", nargs='+', choices=['OK', 'Inconclusive', 'Failed', 'all'], default=['OK'],
     help="Filter genomes by ANI status. Choices: OK, Inconclusive, Failed, all. Default is OK.")   
-    parser.add_argument("--checkm", type=float, default=95, help="Minimum CheckM completeness threshold (default: 95)")
+    parser.add_argument("--checkm", type=float, default=None,
+    help="Minimum CheckM completeness threshold. If not set, no CheckM filtering will be applied.")
     parser.add_argument("--seq", action="store_true", help="Run the script to download sequences")
     parser.add_argument('--host', nargs='+', help='Filter by host species (e.g., "Homo sapiens" "Bos taurus")')
     parser.add_argument('--year', nargs='+', help='Filter by year or year range (e.g., "2015" "2018-2025")')

@@ -26,7 +26,7 @@ fetchM --input input.tsv --outdir results/
 ```
 For retrieving all available sequence data
 ```bash
-fetchM --input input.tsv --outdir results/ --checkm 0 --ani all
+fetchM --input input.tsv --outdir results/ --ani all
 ```
 For downloading sequences with sequence information
 ```bash
@@ -35,7 +35,7 @@ fetchM --input input.tsv --outdir results/ --seq
 For downloading filtered sequences add the available Options below:
 
 ### Options:
-- `--checkm CHECKM` (Minimum CheckM completeness threshold, default: 95)
+- `--checkm CHECKM` (Minimum CheckM completeness threshold, default: NA)
 - `--ani` (Filter genomes by ANI status. Choices: OK, Inconclusive, Failed, all. Default is OK)
 - `--sleep` (Time to wait between requests, default: 0.5s)
 - `--seq` (Enable sequence download mode)
