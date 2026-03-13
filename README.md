@@ -1,7 +1,7 @@
-# FetchM: Metadata Fetching and Analysis Tool
+# fetchm: Metadata Fetching and Analysis Tool
 
 ## Overview
-FetchM is a Python-based tool for fetching and analyzing genomic metadata from NCBI BioSample records. When you download ncbi_dataset.tsv from the NCBI genome database, the metadata fields such as 'Collection Date', 'Host', 'Geographic Location', and 'Isolation Source' are missing. This tool helps fetch the associated metadata for each BioSample ID. FetchM requires an input file (ncbi_dataset.tsv) from the NCBI genome database, retrieves additional annotations from NCBI, filters the data based on quality thresholds, and generates visualizations to help interpret the results. You can also download the filtered sequences. 
+fetchm is a Python-based tool for fetching and analyzing genomic metadata from NCBI BioSample records. When you download ncbi_dataset.tsv from the NCBI genome database, the metadata fields such as 'Collection Date', 'Host', 'Geographic Location', and 'Isolation Source' are missing. This tool helps fetch the associated metadata for each BioSample ID. fetchm requires an input file (ncbi_dataset.tsv) from the NCBI genome database, retrieves additional annotations from NCBI, filters the data based on quality thresholds, and generates visualizations to help interpret the results. You can also download the filtered sequences. 
 
 ## Features
 - Fetch metadata from NCBI BioSample API.
@@ -16,44 +16,101 @@ FetchM is a Python-based tool for fetching and analyzing genomic metadata from N
 ```bash
 conda create -n fetchm python=3.9
 conda activate fetchm
-pip install fetchM
+pip install fetchm
 ```
 
 ## Usage
-Run FetchM with the following command:
-```bash
-fetchM --input input.tsv --outdir results/
-```
-For retrieving all available sequence data
-```bash
-fetchM --input input.tsv --outdir results/ --ani all
-```
-For downloading sequences with sequence information
-```bash
-fetchM --input input.tsv --outdir results/ --seq
-```
-For downloading filtered sequences add the available Options below:
+fetchm has three main modes:
 
-### Options:
-- `--checkm CHECKM` (Minimum CheckM completeness threshold, default: NA)
-- `--ani` (Filter genomes by ANI status. Choices: OK, Inconclusive, Failed, all. Default is OK)
-- `--sleep` (Time to wait between requests, default: 0.5s)
-- `--seq` (Enable sequence download mode)
+1. Generate metadata summaries and `ncbi_clean.csv` from an NCBI dataset TSV:
+```bash
+fetchm metadata --input ncbi_dataset.tsv --outdir results/
+```
 
-Downloading sequences based on different criteria
-- `--host HOST [HOST ...]` (Filter by host species, e.g., `"Homo sapiens" "Bos taurus"`)
-- `--year YEAR [YEAR ...]` (Filter by year or year range, e.g., `"2015" "2018-2025"`)
-- `--country COUNTRY [COUNTRY ...]` (Filter by country, e.g., `"Bangladesh" "United States"`)
-- `--cont CONT [CONT ...]` (Filter by continent, e.g., `"Asia" "Africa"`)
-- `--subcont SUBCONT [SUBCONT ...]` (Filter by subcontinent, e.g., `"Southern Asia" "Western Africa"`)
+2. Run the full workflow: metadata generation plus sequence download:
+```bash
+fetchm run --input ncbi_dataset.tsv --outdir results/
+```
+
+3. Download sequences later from an existing `ncbi_clean.csv`:
+```bash
+fetchm seq --input results/<organism>/metadata_output/ncbi_clean.csv --outdir results/<organism>/sequence
+```
+
+Common examples:
+
+Download all metadata records regardless of ANI status:
+```bash
+fetchm metadata --input ncbi_dataset.tsv --outdir results/ --ani all
+```
+
+Run the full pipeline with a CheckM threshold:
+```bash
+fetchm run --input ncbi_dataset.tsv --outdir results/ --checkm 95
+```
+
+Download only sequences from human isolates collected between 2018 and 2024:
+```bash
+fetchm seq \
+  --input results/<organism>/metadata_output/ncbi_clean.csv \
+  --outdir results/<organism>/sequence \
+  --host "Homo sapiens" \
+  --year 2018-2024
+```
+
+Download only sequences from a specific country or continent:
+```bash
+fetchm seq --input ncbi_clean.csv --outdir sequence_output --country Bangladesh
+fetchm seq --input ncbi_clean.csv --outdir sequence_output --cont Asia
+```
+
+Check download completeness without downloading anything:
+```bash
+fetchm seq --input ncbi_clean.csv --outdir sequence_output --check-only
+```
+
+Important notes:
+
+- `fetchm run` already includes sequence downloading. You do not need to add `--seq` when using `fetchm run`.
+- `--seq` is only relevant for the legacy `fetchM` command, where it controls whether sequence downloading happens after metadata generation.
+- `fetchm seq` supports metadata-based sequence filters: `--host`, `--year`, `--country`, `--cont`, and `--subcont`.
+- Metadata filtering options for `fetchm metadata` and `fetchm run` include `--ani`, `--checkm`, and `--sleep`.
+- Sequence retry behavior can be adjusted with `--retries` and `--retry-delay`.
+
+Legacy compatibility commands:
+```bash
+fetchM --input ncbi_dataset.tsv --outdir results/
+fetchM --input ncbi_dataset.tsv --outdir results/ --seq
+fetchM-seq --input ncbi_clean.csv --outdir sequence_output
+```
+
+### Test With `test.tsv`
+
+Run a quick metadata-only smoke test:
+```bash
+fetchm metadata --input test.tsv --outdir test_output
+```
+
+Run the full pipeline, including sequence download:
+```bash
+fetchm run --input test.tsv --outdir test_output
+```
+
+Check downloaded sequence completeness from the generated `ncbi_clean.csv`:
+```bash
+fetchm seq \
+  --input test_output/Staphylococcus_haemolyticus/metadata_output/ncbi_clean.csv \
+  --outdir test_output/Staphylococcus_haemolyticus/sequence \
+  --check-only
+```
 
 ## Input
 Download ncbi_dataset.tsv of your target organism(s) from the [NCBI genome database](https://www.ncbi.nlm.nih.gov/datasets/genome/).
 -**ncbi_dataset.tsv**
 
-# 📋 Required Columns for `ncbi_dataset.tsv` in FetchM
+# Required Columns for `ncbi_dataset.tsv` in fetchm
 
-Before running **FetchM**, ensure that your `ncbi_dataset.tsv` file includes the following columns. These columns are necessary for metadata enrichment, quality filtering, and downstream analysis.
+Before running `fetchm`, ensure that your `ncbi_dataset.tsv` file includes the following columns. These columns are necessary for metadata enrichment, quality filtering, and downstream analysis.
 
 ---
 
@@ -84,7 +141,7 @@ Before running **FetchM**, ensure that your `ncbi_dataset.tsv` file includes the
 ---
 
 ## Output
-FetchM creates a subdirectory in `/results/` based on the organism name provided in the input file. Inside this subdirectory, the following folders are created:
+fetchm creates a subdirectory in `/results/` based on the organism name provided in the input file. Inside this subdirectory, the following folders are created:
 - **Metadata summaries** in `metadata_output/`
   - `annotation_summary.csv`
   - `assembly_summary.csv`
@@ -106,7 +163,7 @@ FetchM creates a subdirectory in `/results/` based on the organism name provided
   - `scatter_plot_gene_total_vs_collection_date.tiff`
   - `scatter_plot_total_sequence_length_vs_collection_date.tiff`
   - `Subcontinent_bar_plots.tiff`
-- **Sequences** in `sequences/` (if `--seq` is enabled, it will contain the downloaded genome sequences).
+- **Sequences** in `sequence/` (if `--seq` is enabled, it will contain the downloaded genome sequences).
 
 
 ## Visualizations
@@ -139,4 +196,3 @@ Developed by Tasnimul Arabi Anik.
 
 ## Contributions
 Contributions and improvements are welcome! Feel free to submit a pull request or report issues.
-

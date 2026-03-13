@@ -1,0 +1,9 @@
+include README.md
+include LICENSE
+include requirements.txt
+recursive-include bin *
+recursive-include fetchm *.py
+prune figures
+exclude test.tsv
+global-exclude __pycache__
+global-exclude *.py[cod]
