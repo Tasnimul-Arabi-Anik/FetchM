@@ -1,0 +1,46 @@
+digraph FetchMWorkflow {
+  graph [
+    rankdir=TB,
+    bgcolor="white",
+    pad="0.25",
+    nodesep="0.35",
+    ranksep="0.4",
+    fontname="Helvetica",
+    splines=polyline
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    fontname="Helvetica",
+    fontsize=11,
+    margin="0.16,0.10",
+    color="#1f2937",
+    penwidth=1.1,
+    fillcolor="#f8fafc"
+  ];
+
+  edge [
+    color="#334155",
+    penwidth=1.1,
+    arrowsize=0.75,
+    fontname="Helvetica",
+    fontsize=10
+  ];
+
+  start [shape=oval, fillcolor="#dbeafe", label="Start"];
+  input [fillcolor="#e0f2fe", label="Download ncbi_dataset.tsv\nfrom NCBI Genome Datasets"];
+  command [fillcolor="#ede9fe", label="Choose workflow\nfetchm metadata | fetchm run | fetchm seq"];
+  prep [fillcolor="#fef3c7", label="Load input, validate required columns,\nand optionally filter by ANI status\nand CheckM completeness"];
+  metadata [fillcolor="#fee2e2", label="Retrieve linked BioSample metadata\nand standardize key fields\nIsolation Source | Collection Date |\nGeographic Location | Host"];
+  outputs [fillcolor="#d1fae5", label="Create core outputs\nupdated TSV | ncbi_clean.csv |\nsummary tables | harmonization report |\nfigures and geographic map"];
+  decision [shape=diamond, fillcolor="#fef3c7", label="Need sequence\ndownloads?"];
+  seq [fillcolor="#e0f2fe", label="Filter by host, year, country,\ncontinent, or subcontinent;\nresolve FTP paths; download FASTA files\nwith retries and audit failures"];
+  end_meta [shape=oval, fillcolor="#dbeafe", label="Metadata workflow complete"];
+  end_all [shape=oval, fillcolor="#dbeafe", label="Metadata + sequence workflow complete"];
+
+  start -> input -> command -> prep -> metadata -> outputs -> decision;
+  decision -> end_meta [label="No"];
+  decision -> seq [label="Yes"];
+  seq -> end_all;
+}

@@ -67,6 +67,8 @@ Two example inputs are already bundled in the repository:
 
 - `test.tsv`: quick smoke-test dataset.
 - `Vibrio_v1.tsv`: the larger dataset used in the manuscript workflow.
+- `figures/fetchm_workflow.svg`: workflow flowchart for GitHub/documentation.
+- `figures/fetchm_workflow.tiff`: 600 dpi manuscript-ready workflow figure.
 
 Quick smoke test:
 
