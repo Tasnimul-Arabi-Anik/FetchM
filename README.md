@@ -24,6 +24,56 @@ pip install fetchm
 
 `fetchm` uses Python dependencies only. No separate `wget` installation is required for the current release.
 
+## NCBI API Key
+For faster metadata retrieval, you can provide an NCBI API key.
+
+How to create one:
+
+1. Sign in to your My NCBI account.
+2. Open Account Settings.
+3. Find `API Key Management`.
+4. Create an API key.
+
+Official NCBI references:
+
+- https://www.ncbi.nlm.nih.gov/books/NBK25497/
+- https://www.ncbi.nlm.nih.gov/books/NBK53593/
+- https://www.ncbi.nlm.nih.gov/datasets/docs/v2/api/api-keys/
+
+How `fetchm` uses request pacing:
+
+- without an API key: default request delay is `0.34` seconds
+- with an API key: default request delay is `0.12` seconds
+- without an API key: default worker count is `3`
+- with an API key: default worker count is `8`
+
+`fetchm` also keeps a persistent SQLite metadata cache inside each organism output directory so reruns do not need to refetch previously retrieved BioSample records.
+
+You can pass the key directly:
+
+```bash
+fetchm metadata --input ncbi_dataset.tsv --outdir results/ --api-key YOUR_NCBI_API_KEY
+```
+
+Or use an environment variable:
+
+```bash
+export NCBI_API_KEY=YOUR_NCBI_API_KEY
+fetchm metadata --input ncbi_dataset.tsv --outdir results/
+```
+
+Optional contact email:
+
+```bash
+fetchm metadata --input ncbi_dataset.tsv --outdir results/ --api-key YOUR_NCBI_API_KEY --email you@example.com
+```
+
+Optional worker override:
+
+```bash
+fetchm metadata --input ncbi_dataset.tsv --outdir results/ --api-key YOUR_NCBI_API_KEY --workers 8
+```
+
 ## Usage
 `fetchm` has three main commands:
 
@@ -123,7 +173,7 @@ The harmonization report gives a quick completeness summary for the standardized
 
 ## Notes
 - `fetchm run` already includes sequence downloading.
-- `fetchm metadata` and `fetchm run` support `--ani`, `--checkm`, and `--sleep`.
+- `fetchm metadata` and `fetchm run` support `--ani`, `--checkm`, `--sleep`, `--api-key`, `--email`, and `--workers`.
 - `fetchm seq` supports `--host`, `--year`, `--country`, `--cont`, `--subcont`, `--retries`, `--retry-delay`, and `--check-only`.
 - Scatter plots are skipped automatically when the filtered dataset does not contain enough valid points.
 - Runtime depends strongly on dataset size, NCBI responsiveness, and network conditions.

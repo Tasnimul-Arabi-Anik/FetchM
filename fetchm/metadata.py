@@ -8,9 +8,12 @@ import seaborn as sns
 import scipy.stats as stats
 import argparse
 import re
+import sqlite3
+import threading
 from tqdm import tqdm
 import logging
 from typing import Tuple, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import plotly.express as px
 import plotly.io as pio
 
@@ -25,6 +28,14 @@ METADATA_FOLDER_NAME = "metadata_output"
 FIGURES_FOLDER_NAME = "figures"
 SEQUENCE_FOLDER_NAME = "sequence"
 NCBI_TIMEOUT = 60
+DEFAULT_SLEEP_NO_API_KEY = 0.34
+DEFAULT_SLEEP_WITH_API_KEY = 0.15
+DEFAULT_WORKERS_NO_API_KEY = 3
+DEFAULT_WORKERS_WITH_API_KEY = 6
+CACHE_NEGATIVE_RESULTS = False
+DEFAULT_FETCH_RETRIES = 3
+DEFAULT_RETRY_BACKOFF = 1.5
+CACHE_DB_FILENAME = "fetchm_metadata_cache.sqlite3"
 MISSING_VALUE_TOKENS = {
     "",
     "unknown",
@@ -65,6 +76,89 @@ DATE_YEAR_PATTERN = re.compile(r"(19|20)\d{2}")
 
 # Cache to store fetched metadata
 metadata_cache: Dict[str, Tuple] = {}
+thread_local = threading.local()
+
+
+def get_ncbi_session() -> requests.Session:
+    session = getattr(thread_local, "ncbi_session", None)
+    if session is None:
+        session = requests.Session()
+        thread_local.ncbi_session = session
+    return session
+
+
+class RequestRateLimiter:
+    def __init__(self, interval_seconds: float) -> None:
+        self.interval_seconds = max(interval_seconds, 0.0)
+        self.lock = threading.Lock()
+        self.next_allowed_time = 0.0
+
+    def wait(self) -> None:
+        with self.lock:
+            now = time.monotonic()
+            wait_time = max(0.0, self.next_allowed_time - now)
+            scheduled_time = max(now, self.next_allowed_time) + self.interval_seconds
+            self.next_allowed_time = scheduled_time
+        if wait_time > 0:
+            time.sleep(wait_time)
+
+
+class MetadataPersistentCache:
+    def __init__(self, db_path: str) -> None:
+        self.db_path = db_path
+        self.lock = threading.Lock()
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._initialize()
+
+    def _initialize(self) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS biosample_metadata (
+                    biosample_id TEXT PRIMARY KEY,
+                    isolation_source TEXT,
+                    collection_date TEXT,
+                    geo_location TEXT,
+                    host TEXT
+                )
+                """
+            )
+
+    def get(self, biosample_id: str) -> Optional[Tuple]:
+        with self.lock:
+            row = self.conn.execute(
+                """
+                SELECT isolation_source, collection_date, geo_location, host
+                FROM biosample_metadata
+                WHERE biosample_id = ?
+                """,
+                (biosample_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return tuple(pd.NA if value is None else value for value in row)
+
+    def set(self, biosample_id: str, value: Tuple) -> None:
+        serializable = tuple(None if pd.isna(item) else str(item) for item in value)
+        with self.lock:
+            self.conn.execute(
+                """
+                INSERT INTO biosample_metadata (
+                    biosample_id, isolation_source, collection_date, geo_location, host
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(biosample_id) DO UPDATE SET
+                    isolation_source = excluded.isolation_source,
+                    collection_date = excluded.collection_date,
+                    geo_location = excluded.geo_location,
+                    host = excluded.host
+                """,
+                (biosample_id, *serializable),
+            )
+            self.conn.commit()
+
+    def close(self) -> None:
+        with self.lock:
+            self.conn.close()
 
 
 def load_data(input_file: str) -> pd.DataFrame:
@@ -123,53 +217,163 @@ def create_output_directory(output_directory: str, organism_name: str) -> Tuple[
 
 
 
-def fetch_metadata(biosample_id: str, sleep_time: float) -> Tuple:
+def get_effective_sleep(sleep_time: Optional[float], api_key: Optional[str]) -> float:
+    if sleep_time is not None:
+        return sleep_time
+    return DEFAULT_SLEEP_WITH_API_KEY if api_key else DEFAULT_SLEEP_NO_API_KEY
+
+
+def get_effective_workers(workers: Optional[int], api_key: Optional[str]) -> int:
+    if workers is not None:
+        return max(1, workers)
+    return DEFAULT_WORKERS_WITH_API_KEY if api_key else DEFAULT_WORKERS_NO_API_KEY
+
+
+def fetch_metadata(
+    biosample_id: str,
+    *,
+    api_key: Optional[str] = None,
+    email: Optional[str] = None,
+    persistent_cache: Optional[MetadataPersistentCache] = None,
+    rate_limiter: Optional[RequestRateLimiter] = None,
+) -> Tuple:
     """Fetch metadata from NCBI."""
     if biosample_id in metadata_cache:
         return metadata_cache[biosample_id]
 
-    url = f"{NCBI_URL}?db=biosample&id={biosample_id}&retmode=xml"
-    try:
-        response = requests.get(url, timeout=NCBI_TIMEOUT)
-        response.raise_for_status()
-        time.sleep(sleep_time)
-        data = xmltodict.parse(response.text)
+    if persistent_cache is not None:
+        cached_value = persistent_cache.get(biosample_id)
+        if cached_value is not None:
+            metadata_cache[biosample_id] = cached_value
+            return cached_value
 
-        if not data.get("BioSampleSet"):
-            logging.warning(f"No 'BioSampleSet' found for BioSample {biosample_id}")
-            return pd.NA, pd.NA, pd.NA, pd.NA
+    params = {
+        "db": "biosample",
+        "id": biosample_id,
+        "retmode": "xml",
+        "tool": "fetchm",
+    }
+    if api_key:
+        params["api_key"] = api_key
+    if email:
+        params["email"] = email
 
-        biosample = data["BioSampleSet"].get("BioSample")
-        if not biosample:
-            logging.warning(f"No 'BioSample' found for BioSample {biosample_id}")
-            return pd.NA, pd.NA, pd.NA, pd.NA
+    for attempt in range(1, DEFAULT_FETCH_RETRIES + 1):
+        try:
+            if rate_limiter is not None:
+                rate_limiter.wait()
 
-        attributes = biosample.get("Attributes", {}).get("Attribute", [])
-        if not attributes:
-            logging.warning(f"No 'Attributes' found for BioSample {biosample_id}")
-            return pd.NA, pd.NA, pd.NA, pd.NA
+            response = get_ncbi_session().get(NCBI_URL, params=params, timeout=NCBI_TIMEOUT)
+            response.raise_for_status()
+            data = xmltodict.parse(response.text)
 
-        # Extract metadata
-        isolation_source = collection_date = geo_location = host = pd.NA
-        for attr in attributes:
-            if isinstance(attr, dict):
-                if attr.get("@attribute_name") == "isolation_source":
-                    isolation_source = attr.get("#text", pd.NA)
-                elif attr.get("@attribute_name") == "collection_date":
-                    collection_date = attr.get("#text", pd.NA)
-                elif attr.get("@attribute_name") == "geo_loc_name":
-                    geo_location = attr.get("#text", pd.NA)
-                elif attr.get("@attribute_name") == "host":
-                    host = attr.get("#text", pd.NA)
+            biosample_set = data.get("BioSampleSet")
+            if not biosample_set or not isinstance(biosample_set, dict):
+                logging.warning(f"No 'BioSampleSet' found for BioSample {biosample_id}")
+                return pd.NA, pd.NA, pd.NA, pd.NA
 
-        metadata_cache[biosample_id] = (isolation_source, collection_date, geo_location, host)
-        return isolation_source, collection_date, geo_location, host
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Network error fetching BioSample {biosample_id}: {e}")
-        return pd.NA, pd.NA, pd.NA, pd.NA
-    except Exception as e:
-        logging.error(f"Unexpected error fetching BioSample {biosample_id}: {e}")
-        return pd.NA, pd.NA, pd.NA, pd.NA
+            biosample = biosample_set.get("BioSample")
+            if isinstance(biosample, list):
+                biosample = biosample[0] if biosample else None
+            if not biosample or not isinstance(biosample, dict):
+                logging.warning(f"No 'BioSample' found for BioSample {biosample_id}")
+                return pd.NA, pd.NA, pd.NA, pd.NA
+
+            attributes_node = biosample.get("Attributes") or {}
+            if not isinstance(attributes_node, dict):
+                logging.warning(f"No 'Attributes' found for BioSample {biosample_id}")
+                return pd.NA, pd.NA, pd.NA, pd.NA
+
+            attributes = attributes_node.get("Attribute", [])
+            if isinstance(attributes, dict):
+                attributes = [attributes]
+            if not attributes:
+                logging.warning(f"No 'Attributes' found for BioSample {biosample_id}")
+                return pd.NA, pd.NA, pd.NA, pd.NA
+
+            isolation_source = collection_date = geo_location = host = pd.NA
+            for attr in attributes:
+                if isinstance(attr, dict):
+                    if attr.get("@attribute_name") == "isolation_source":
+                        isolation_source = attr.get("#text", pd.NA)
+                    elif attr.get("@attribute_name") == "collection_date":
+                        collection_date = attr.get("#text", pd.NA)
+                    elif attr.get("@attribute_name") == "geo_loc_name":
+                        geo_location = attr.get("#text", pd.NA)
+                    elif attr.get("@attribute_name") == "host":
+                        host = attr.get("#text", pd.NA)
+
+            metadata_tuple = (isolation_source, collection_date, geo_location, host)
+            metadata_cache[biosample_id] = metadata_tuple
+            if persistent_cache is not None:
+                persistent_cache.set(biosample_id, metadata_tuple)
+            return metadata_tuple
+        except requests.exceptions.HTTPError as e:
+            status_code = e.response.status_code if e.response is not None else None
+            if status_code in {429, 500, 502, 503, 504} and attempt < DEFAULT_FETCH_RETRIES:
+                backoff_seconds = DEFAULT_RETRY_BACKOFF * attempt
+                logging.warning(
+                    "Transient HTTP error fetching BioSample %s on attempt %s/%s: %s. Retrying in %.1fs.",
+                    biosample_id,
+                    attempt,
+                    DEFAULT_FETCH_RETRIES,
+                    e,
+                    backoff_seconds,
+                )
+                time.sleep(backoff_seconds)
+                continue
+            logging.error(f"Network error fetching BioSample {biosample_id}: {e}")
+            break
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Network error fetching BioSample {biosample_id}: {e}")
+            break
+        except Exception as e:
+            logging.error(f"Unexpected error fetching BioSample {biosample_id}: {e}")
+            break
+
+    if CACHE_NEGATIVE_RESULTS:
+        metadata_cache[biosample_id] = (pd.NA, pd.NA, pd.NA, pd.NA)
+    return pd.NA, pd.NA, pd.NA, pd.NA
+
+
+def fetch_all_metadata(
+    biosample_ids: List[object],
+    *,
+    api_key: Optional[str],
+    email: Optional[str],
+    persistent_cache: MetadataPersistentCache,
+    request_interval: float,
+    workers: int,
+) -> Dict[str, Tuple]:
+    rate_limiter = RequestRateLimiter(request_interval)
+    unique_ids = []
+    seen = set()
+    for biosample_id in biosample_ids:
+        if pd.isna(biosample_id):
+            continue
+        biosample_str = str(biosample_id)
+        if biosample_str not in seen:
+            seen.add(biosample_str)
+            unique_ids.append(biosample_str)
+
+    results: Dict[str, Tuple] = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {
+            executor.submit(
+                fetch_metadata,
+                biosample_id,
+                api_key=api_key,
+                email=email,
+                persistent_cache=persistent_cache,
+                rate_limiter=rate_limiter,
+            ): biosample_id
+            for biosample_id in unique_ids
+        }
+        for future in tqdm(as_completed(future_map), total=len(future_map), desc="Fetching metadata"):
+            biosample_id = future_map[future]
+            results[biosample_id] = future.result()
+
+    return results
 
 
 def standardize_date(date: str) -> str:
@@ -847,7 +1051,36 @@ def build_metadata_parser(*, add_help: bool = True) -> argparse.ArgumentParser:
     )
     parser.add_argument("--input", required=True, help="Path to the input TSV file")
     parser.add_argument("--outdir", required=True, help="Path to the output directory")
-    parser.add_argument("--sleep", type=float, default=0.5, help="Time to wait between requests (default: 0.5s)")
+    parser.add_argument(
+        "--sleep",
+        type=float,
+        default=None,
+        help=(
+            "Time to wait between NCBI requests. "
+            f"Default is {DEFAULT_SLEEP_NO_API_KEY}s without an API key and "
+            f"{DEFAULT_SLEEP_WITH_API_KEY}s with an API key."
+        ),
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="NCBI API key. If omitted, fetchm will also look for NCBI_API_KEY in the environment.",
+    )
+    parser.add_argument(
+        "--email",
+        default=None,
+        help="Contact email to send with NCBI E-utilities requests.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help=(
+            "Number of concurrent metadata fetch workers. "
+            f"Default is {DEFAULT_WORKERS_NO_API_KEY} without an API key and "
+            f"{DEFAULT_WORKERS_WITH_API_KEY} with an API key."
+        ),
+    )
     parser.add_argument("--ani", nargs='+', choices=['OK', 'Inconclusive', 'Failed', 'all'], default=['OK'],
     help="Filter genomes by ANI status. Choices: OK, Inconclusive, Failed, all. Default is OK.")   
     parser.add_argument("--checkm", type=float, default=None,
@@ -860,7 +1093,24 @@ def build_metadata_parser(*, add_help: bool = True) -> argparse.ArgumentParser:
 def run_metadata_pipeline(args: argparse.Namespace) -> None:
     """Run the metadata workflow and optionally download sequences."""
 
+    persistent_cache: Optional[MetadataPersistentCache] = None
     try:
+        api_key = args.api_key or os.getenv("NCBI_API_KEY")
+        effective_sleep = get_effective_sleep(args.sleep, api_key)
+        effective_workers = get_effective_workers(args.workers, api_key)
+        if api_key:
+            logging.info(
+                "Using NCBI API key with request delay %.2fs and %s workers. The key itself is not logged.",
+                effective_sleep,
+                effective_workers,
+            )
+        else:
+            logging.info(
+                "No NCBI API key detected. Using request delay %.2fs and %s workers.",
+                effective_sleep,
+                effective_workers,
+            )
+
         # Load and filter data
         df = load_data(args.input)
         df = filter_data(df, args.checkm, args.ani)
@@ -868,6 +1118,8 @@ def run_metadata_pipeline(args: argparse.Namespace) -> None:
         # Create output directories
         organism_name = df["Organism Name"].iloc[0].replace(" ", "_")
         organism_folder, metadata_folder, figures_folder, sequence_folder = create_output_directory(args.outdir, organism_name)
+        cache_db_path = os.path.join(organism_folder, CACHE_DB_FILENAME)
+        persistent_cache = MetadataPersistentCache(cache_db_path)
 
         # Fetch metadata
         df["Isolation Source"] = pd.NA
@@ -875,10 +1127,22 @@ def run_metadata_pipeline(args: argparse.Namespace) -> None:
         df["Geographic Location"] = pd.NA
         df["Host"] = pd.NA
 
-        for index, row in tqdm(df.iterrows(), total=len(df), desc="Fetching metadata"):
+        biosample_results = fetch_all_metadata(
+            df["Assembly BioSample Accession"].tolist(),
+            api_key=api_key,
+            email=args.email,
+            persistent_cache=persistent_cache,
+            request_interval=effective_sleep,
+            workers=effective_workers,
+        )
+
+        for index, row in df.iterrows():
             biosample_id = row["Assembly BioSample Accession"]
             if pd.notna(biosample_id):
-                isolation_source, collection_date, geo_location, host = fetch_metadata(biosample_id, args.sleep)
+                isolation_source, collection_date, geo_location, host = biosample_results.get(
+                    str(biosample_id),
+                    (pd.NA, pd.NA, pd.NA, pd.NA),
+                )
                 df.at[index, "Isolation Source"] = isolation_source
                 df.at[index, "Collection Date"] = collection_date
                 df.at[index, "Geographic Location"] = geo_location
@@ -1009,6 +1273,9 @@ def run_metadata_pipeline(args: argparse.Namespace) -> None:
     except Exception as e:
         logging.error(f"Script failed: {e}")
         raise SystemExit(1) from e
+    finally:
+        if persistent_cache is not None:
+            persistent_cache.close()
 
 
 def main() -> None:
