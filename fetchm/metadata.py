@@ -7,9 +7,10 @@ import os
 import seaborn as sns
 import scipy.stats as stats
 import argparse
+import re
 from tqdm import tqdm
 import logging
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Optional
 import plotly.express as px
 import plotly.io as pio
 
@@ -23,6 +24,44 @@ NCBI_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 METADATA_FOLDER_NAME = "metadata_output"
 FIGURES_FOLDER_NAME = "figures"
 SEQUENCE_FOLDER_NAME = "sequence"
+NCBI_TIMEOUT = 60
+MISSING_VALUE_TOKENS = {
+    "",
+    "unknown",
+    "unk",
+    "unk.",
+    "missing",
+    "na",
+    "n/a",
+    "n.a.",
+    "none",
+    "null",
+    "absent",
+    "provided",
+    "not collected",
+    "not applicable",
+    "not available",
+    "not known",
+    "no data",
+    "no date",
+    "no date information",
+    "no date data",
+    "no date specified",
+    "no location",
+    "no location information",
+    "no location data",
+    "no location specified",
+    "no host",
+    "no host information",
+    "no host data",
+    "no host specified",
+    "not specified",
+    "not provided",
+    "missing data",
+    "missing value",
+    "unavailable",
+}
+DATE_YEAR_PATTERN = re.compile(r"(19|20)\d{2}")
 
 # Cache to store fetched metadata
 metadata_cache: Dict[str, Tuple] = {}
@@ -91,7 +130,7 @@ def fetch_metadata(biosample_id: str, sleep_time: float) -> Tuple:
 
     url = f"{NCBI_URL}?db=biosample&id={biosample_id}&retmode=xml"
     try:
-        response = requests.get(url)
+        response = requests.get(url, timeout=NCBI_TIMEOUT)
         response.raise_for_status()
         time.sleep(sleep_time)
         data = xmltodict.parse(response.text)
@@ -137,56 +176,75 @@ def standardize_date(date: str) -> str:
     """Standardize the 'Collection Date' column."""
     if pd.isna(date):
         return "absent"
-    
-    cleaned = str(date).strip().lower()
-    if cleaned in [
-        "unknown", "missing", "na", "n/a", "none", "absent",
-        "not collected", "not applicable", "no date", "no date information",
-        "no date data", "no date specified", "not specified", "not provided", "provided"
-    ]:
+
+    cleaned = str(date).strip()
+    if not cleaned:
         return "absent"
-    
-    try:
-        year = str(date).split("-")[0]
-        return year if year.isdigit() and len(year) == 4 else "absent"
-    except:
+
+    if cleaned.lower() in MISSING_VALUE_TOKENS:
         return "absent"
+
+    match = DATE_YEAR_PATTERN.search(cleaned)
+    if not match:
+        return "absent"
+
+    year = int(match.group(0))
+    current_year = pd.Timestamp.utcnow().year
+    if 1900 <= year <= current_year:
+        return str(year)
+
+    return "absent"
+
+
+def normalize_missing_string(value: object) -> Optional[str]:
+    if pd.isna(value):
+        return None
+
+    normalized = " ".join(str(value).strip().split())
+    if not normalized or normalized.lower() in MISSING_VALUE_TOKENS:
+        return None
+
+    return normalized
+
+
+def normalize_title_case(value: str) -> str:
+    tokens = re.split(r"(\W+)", value)
+    normalized_tokens = []
+    for token in tokens:
+        if token.isalpha() and token.upper() not in {"USA", "UK", "UAE", "DRC"}:
+            normalized_tokens.append(token.capitalize())
+        else:
+            normalized_tokens.append(token)
+    return "".join(normalized_tokens)
+
+
+def standardize_text_field(value: str) -> str:
+    normalized = normalize_missing_string(value)
+    if normalized is None:
+        return "absent"
+
+    return normalized
 
 
 def standardize_location(location: str) -> str:
     """Standardize the 'Geographic Location' column."""
-    if pd.isna(location):
+    normalized = normalize_missing_string(location)
+    if normalized is None:
         return "absent"
-    
-    cleaned = location.strip().lower()
-    if cleaned in [
-        "missing", "unknown", "na", "n/a", "none", "absent", "provided",
-        "not collected", "not applicable", "no location", "no location information",
-        "no location data", "no location specified", "not specified", "not provided"
-    ]:
-        return "absent"
-    
-    try:
-        country = location.split(":")[0].strip()
-        return country
-    except:
-        return "absent"
+
+    country = normalized.split(":")[0].strip()
+    normalized_country = normalize_country_name(country)
+    return normalized_country if normalized_country else "absent"
 
 
 def standardize_host(host: str) -> str:
     """Standardize the 'Host' column."""
-    if pd.isna(host):
-        return "absent"
-    
-    cleaned = host.strip().lower()
-    if cleaned in [
-        "unknown", "missing", "na", "n/a", "none", "absent", "provided",
-        "not collected", "not applicable", "no host", "no host information",
-        "no host data", "no host specified", "not specified", "not provided"
-    ]:
-        return "absent"
-    
-    return host
+    return standardize_text_field(host)
+
+
+def standardize_isolation_source(source: str) -> str:
+    """Standardize the 'Isolation Source' column."""
+    return standardize_text_field(source)
 
 
 def save_summary(df: pd.DataFrame, output_file: str) -> None:
@@ -258,7 +316,7 @@ def plot_geo_choropleth(variable: str, frequency: pd.Series, figures_folder: str
             color="Frequency",
             hover_name=variable,
             hover_data={"Frequency": True},
-            color_continuous_scale="Blues",
+            color_continuous_scale="Viridis",
             title=f"Geographic Distribution",
             template="plotly_white"
         )
@@ -322,8 +380,8 @@ def plot_scatter_with_trend_and_corr(
 
         plot_data = pd.DataFrame({'x': x_numeric, 'y': y_numeric}).dropna()
 
-        if len(plot_data) == 0:
-            logging.warning(f"No valid data points for {title}")
+        if len(plot_data) < 2:
+            logging.warning("Skipping %s because fewer than two valid data points are available.", title)
             return
 
         # Outlier removal (z-score >3)
@@ -336,8 +394,12 @@ def plot_scatter_with_trend_and_corr(
 
         filtered_data = plot_data[(plot_data['x'] >= lower_bound) & (plot_data['x'] <= upper_bound)]
 
-        if len(filtered_data) == 0:
-            logging.warning(f"All data points were x-outliers (IQR method) for {title}")
+        if len(filtered_data) < 2:
+            logging.warning("Skipping %s because fewer than two points remain after filtering.", title)
+            return
+
+        if filtered_data["x"].nunique() < 2 or filtered_data["y"].nunique() < 2:
+            logging.warning("Skipping %s because the remaining data have no variance.", title)
             return
 
         # Correlations
@@ -415,6 +477,42 @@ def generate_metadata_summary(df: pd.DataFrame, output_file: str) -> None:
         logging.info(f"Metadata summary saved to {output_file}")
     except Exception as e:
         logging.error(f"Error generating metadata summary: {e}")
+        raise
+
+
+def generate_harmonization_report(df: pd.DataFrame, output_file: str) -> None:
+    """Generate a completeness report for harmonized metadata fields."""
+    try:
+        tracked_columns = [
+            "Isolation Source",
+            "Collection Date",
+            "Geographic Location",
+            "Host",
+            "Continent",
+            "Subcontinent",
+        ]
+        total_rows = len(df)
+        rows = []
+        for column in tracked_columns:
+            absent_count = int((df[column] == "absent").sum()) if column in df.columns else 0
+            unknown_count = int((df[column] == "Unknown").sum()) if column in df.columns else 0
+            present_count = total_rows - absent_count - unknown_count
+            completeness = 0.0 if total_rows == 0 else (present_count / total_rows) * 100
+            rows.append(
+                {
+                    "Variable": column,
+                    "Total Records": total_rows,
+                    "Present Records": present_count,
+                    "Absent Records": absent_count,
+                    "Unknown Records": unknown_count,
+                    "Completeness (%)": f"{completeness:.2f}",
+                }
+            )
+
+        pd.DataFrame(rows).to_csv(output_file, index=False)
+        logging.info("Metadata harmonization report saved to %s", output_file)
+    except Exception as e:
+        logging.error(f"Error generating metadata harmonization report: {e}")
         raise
 
 
@@ -715,12 +813,12 @@ def normalize_country_name(country):
         if mapped_country.lower() == country_lower:
             return mapped_country
     
-    # If no match found, return original (will default to 'Unknown' later)
-    return country
+    # If no match found, return a normalized title-cased string.
+    return normalize_title_case(country)
 
 def extract_country(geo_location):
     """Extract country name from Geographic Location"""
-    if pd.isna(geo_location):
+    if pd.isna(geo_location) or geo_location == "absent":
         return None
     # Handle cases like "USA: New York" or "United States: California"
     raw_country = geo_location.split(":")[0].strip()
@@ -787,6 +885,7 @@ def run_metadata_pipeline(args: argparse.Namespace) -> None:
                 df.at[index, "Host"] = host
 
         # Standardize columns
+        df["Isolation Source"] = df["Isolation Source"].apply(standardize_isolation_source)
         df["Collection Date"] = df["Collection Date"].apply(standardize_date)
         df["Geographic Location"] = df["Geographic Location"].apply(standardize_location)
         df["Host"] = df["Host"].apply(standardize_host)
@@ -797,9 +896,13 @@ def run_metadata_pipeline(args: argparse.Namespace) -> None:
         
         #save metadata summary
         # Sort the DataFrame to prioritize rows with "GCF" in "Assembly Accession"
-        df_sorted = df.sort_values(by="Assembly Accession", key=lambda x: x.str.startswith("GCF"), ascending=False)
+        df_sorted = df.sort_values(
+            by="Assembly Accession",
+            key=lambda x: x.fillna("").str.startswith("GCF"),
+            ascending=False,
+        )
         # Drop duplicates based on "Assembly Name", keeping the first occurrence (which will be the "GCF" row)
-        df2 = df_sorted.drop_duplicates(subset=["Assembly Name"], keep="first")
+        df2 = df_sorted.drop_duplicates(subset=["Assembly Name"], keep="first").copy()
         output_file = os.path.join(metadata_folder, "metadata_summary.csv")
         generate_metadata_summary(df2, output_file)
         
@@ -809,9 +912,9 @@ def run_metadata_pipeline(args: argparse.Namespace) -> None:
         
         # Generate distribution plots for assembly columns
         for column in ["Assembly Stats Total Sequence Length"]:
-            df2.loc[:, column] = pd.to_numeric(df2[column], errors="coerce")
-            if not df2[column].empty:
-                plot_distribution(column, df2[column], column, figures_folder)
+            series = pd.to_numeric(df2[column], errors="coerce").dropna()
+            if not series.empty:
+                plot_distribution(column, series, column, figures_folder)
 
         # Generate and save bar plots
         for variable in ["Geographic Location", "Host", "Collection Date"]:
@@ -825,15 +928,15 @@ def run_metadata_pipeline(args: argparse.Namespace) -> None:
             plot_geo_choropleth(variable, frequency, figures_folder)
 
         #save annotation summary
-        df3 = df[df["Annotation Name"] == "NCBI Prokaryotic Genome Annotation Pipeline (PGAP)"]
+        df3 = df[df["Annotation Name"] == "NCBI Prokaryotic Genome Annotation Pipeline (PGAP)"].copy()
         output_file = os.path.join(metadata_folder, "annotation_summary.csv")
         generate_annotation_summary(df3, output_file)
         
         # Generate distribution plots for annotation columns
         for column in ["Annotation Count Gene Total", "Annotation Count Gene Protein-coding", "Annotation Count Gene Pseudogene"]:
-            df3.loc[:, column] = pd.to_numeric(df3[column], errors="coerce")
-            if not df3[column].empty:
-                plot_distribution(column, df3[column], column, figures_folder)
+            series = pd.to_numeric(df3[column], errors="coerce").dropna()
+            if not series.empty:
+                plot_distribution(column, series, column, figures_folder)
 
         # Filter and sort data for scatter plots
         df3_filtered = df3[df3["Collection Date"] != "absent"].copy()
@@ -878,10 +981,12 @@ def run_metadata_pipeline(args: argparse.Namespace) -> None:
             "Isolation Source", "Collection Date", "Geographic Location", "Host"
         ]
         # Modify your existing code:
-        df4 = df2[columns_to_keep]
+        df4 = df2[columns_to_keep].copy()
         df4 = add_geo_columns(df4)  # Add the new columns
         clean_data_file = os.path.join(metadata_folder, "ncbi_clean.csv")
         save_clean_data(df4, columns_to_keep + ['Continent', 'Subcontinent'], clean_data_file)
+        harmonization_report_file = os.path.join(metadata_folder, "metadata_harmonization_report.csv")
+        generate_harmonization_report(df4, harmonization_report_file)
 
         # Generate and save bar plots for Continent and Subcontinent
         for variable in ["Continent", "Subcontinent"]:
