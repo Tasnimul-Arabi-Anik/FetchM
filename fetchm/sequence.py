@@ -4,8 +4,11 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
+import threading
 import time
 from typing import List, Optional, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import requests
@@ -17,7 +20,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 BASE_URL = "https://ftp.ncbi.nlm.nih.gov/genomes/all"
 DEFAULT_RETRIES = 3
 DEFAULT_RETRY_DELAY = 5.0
+DEFAULT_DOWNLOAD_WORKERS = 4
 FAILED_ACCESSIONS_FILENAME = "failed_accessions.txt"
+DIRECTORY_CACHE_FILENAME = "fetchm_sequence_cache.sqlite3"
 REQUIRED_COLUMNS = {
     "Assembly Accession",
     "Assembly Name",
@@ -27,6 +32,68 @@ REQUIRED_COLUMNS = {
     "Continent",
     "Subcontinent",
 }
+
+
+thread_local = threading.local()
+
+
+def get_requests_session() -> requests.Session:
+    session = getattr(thread_local, "requests_session", None)
+    if session is None:
+        session = requests.Session()
+        thread_local.requests_session = session
+    return session
+
+
+class AssemblyDirectoryCache:
+    def __init__(self, db_path: str) -> None:
+        self.db_path = db_path
+        self.lock = threading.Lock()
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._initialize()
+
+    def _initialize(self) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS assembly_directory_cache (
+                    assembly_accession TEXT PRIMARY KEY,
+                    assembly_name TEXT,
+                    assembly_directory TEXT
+                )
+                """
+            )
+
+    def get(self, assembly_accession: str, assembly_name: str) -> Optional[str]:
+        with self.lock:
+            row = self.conn.execute(
+                """
+                SELECT assembly_directory
+                FROM assembly_directory_cache
+                WHERE assembly_accession = ? AND assembly_name = ?
+                """,
+                (assembly_accession, normalize_assembly_name(assembly_name)),
+            ).fetchone()
+        return None if row is None else row[0]
+
+    def set(self, assembly_accession: str, assembly_name: str, assembly_directory: str) -> None:
+        with self.lock:
+            self.conn.execute(
+                """
+                INSERT INTO assembly_directory_cache (
+                    assembly_accession, assembly_name, assembly_directory
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(assembly_accession) DO UPDATE SET
+                    assembly_name = excluded.assembly_name,
+                    assembly_directory = excluded.assembly_directory
+                """,
+                (assembly_accession, normalize_assembly_name(assembly_name), assembly_directory),
+            )
+            self.conn.commit()
+
+    def close(self) -> None:
+        with self.lock:
+            self.conn.close()
 
 
 def normalize_assembly_name(name: str) -> str:
@@ -51,12 +118,22 @@ def build_parent_url(accession: str) -> str:
 
 
 def list_remote_assembly_directories(parent_url: str) -> List[str]:
-    response = requests.get(parent_url, timeout=60)
+    response = get_requests_session().get(parent_url, timeout=60)
     response.raise_for_status()
     return re.findall(r'href="([^"]+/)"', response.text)
 
 
-def resolve_assembly_directory(accession: str, name: str) -> str:
+def resolve_assembly_directory(
+    accession: str,
+    name: str,
+    *,
+    directory_cache: Optional[AssemblyDirectoryCache] = None,
+) -> str:
+    if directory_cache is not None:
+        cached_directory = directory_cache.get(accession, name)
+        if cached_directory:
+            return cached_directory
+
     parent_url = build_parent_url(accession)
     normalized_name = normalize_assembly_name(name)
     candidate_directories = [
@@ -73,8 +150,10 @@ def resolve_assembly_directory(accession: str, name: str) -> str:
 
     for candidate in unique_candidates:
         candidate_url = f"{parent_url}/{candidate}"
-        response = requests.get(candidate_url, timeout=30)
+        response = get_requests_session().get(candidate_url, timeout=30)
         if response.ok:
+            if directory_cache is not None:
+                directory_cache.set(accession, name, candidate)
             return candidate
 
     directories = list_remote_assembly_directories(parent_url)
@@ -93,15 +172,30 @@ def resolve_assembly_directory(accession: str, name: str) -> str:
 
     fallback_directory = f"{accession}_NA"
     if fallback_directory in matching_directories:
+        if directory_cache is not None:
+            directory_cache.set(accession, name, fallback_directory)
         return fallback_directory
 
-    return matching_directories[0]
+    resolved_directory = matching_directories[0]
+    if directory_cache is not None:
+        directory_cache.set(accession, name, resolved_directory)
+    return resolved_directory
 
 
-def download_genome_fasta_ftp(assembly_accession: str, assembly_name: str, output_folder: str) -> None:
+def download_genome_fasta_ftp(
+    assembly_accession: str,
+    assembly_name: str,
+    output_folder: str,
+    *,
+    directory_cache: Optional[AssemblyDirectoryCache] = None,
+) -> None:
     os.makedirs(output_folder, exist_ok=True)
 
-    assembly_directory = resolve_assembly_directory(assembly_accession, assembly_name)
+    assembly_directory = resolve_assembly_directory(
+        assembly_accession,
+        assembly_name,
+        directory_cache=directory_cache,
+    )
     gz_basename = f"{assembly_directory}_genomic.fna.gz"
     fna_basename = f"{assembly_directory}_genomic.fna"
     url = f"{build_parent_url(assembly_accession)}/{assembly_directory}/{gz_basename}"
@@ -113,7 +207,7 @@ def download_genome_fasta_ftp(assembly_accession: str, assembly_name: str, outpu
         logging.info("Genome FASTA already exists for %s: %s", assembly_accession, fna_filename)
         return
 
-    response = requests.get(url, stream=True, timeout=300)
+    response = get_requests_session().get(url, stream=True, timeout=300)
     response.raise_for_status()
 
     with open(gz_filename, "wb") as gz_file:
@@ -134,10 +228,17 @@ def download_with_retries(
     output_folder: str,
     retries: int,
     retry_delay: float,
+    *,
+    directory_cache: Optional[AssemblyDirectoryCache] = None,
 ) -> None:
     for attempt in range(1, retries + 1):
         try:
-            download_genome_fasta_ftp(assembly_accession, assembly_name, output_folder)
+            download_genome_fasta_ftp(
+                assembly_accession,
+                assembly_name,
+                output_folder,
+                directory_cache=directory_cache,
+            )
             return
         except Exception as exc:
             logging.warning(
@@ -300,6 +401,12 @@ def add_sequence_arguments(
         action="store_true",
         help="Only audit the output directory against the input CSV without downloading.",
     )
+    parser.add_argument(
+        "--download-workers",
+        type=int,
+        default=DEFAULT_DOWNLOAD_WORKERS,
+        help=f"Concurrent genome download workers (default: {DEFAULT_DOWNLOAD_WORKERS})",
+    )
     return parser
 
 
@@ -314,6 +421,30 @@ def build_sequence_parser(*, add_help: bool = True) -> argparse.ArgumentParser:
 
 def parse_args() -> argparse.Namespace:
     return build_sequence_parser().parse_args()
+
+
+def download_single_row(
+    row: pd.Series,
+    output_dir: str,
+    retries: int,
+    retry_delay: float,
+    directory_cache: AssemblyDirectoryCache,
+) -> Optional[str]:
+    assembly_accession = row["Assembly Accession"]
+    assembly_name = row["Assembly Name"]
+    try:
+        download_with_retries(
+            assembly_accession,
+            assembly_name,
+            output_dir,
+            retries=retries,
+            retry_delay=retry_delay,
+            directory_cache=directory_cache,
+        )
+        return None
+    except Exception as exc:
+        logging.error("Failed to download %s after retries: %s", assembly_accession, exc)
+        return str(assembly_accession)
 
 
 def run_sequence_downloads(
@@ -348,21 +479,27 @@ def run_sequence_downloads(
             logging.info("Wrote an empty failure list to %s", failed_path)
         return missing_accessions
 
+    directory_cache = AssemblyDirectoryCache(os.path.join(output_dir, DIRECTORY_CACHE_FILENAME))
     failed_accessions = []
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="Downloading genome FASTA files"):
-        assembly_accession = row["Assembly Accession"]
-        assembly_name = row["Assembly Name"]
-        try:
-            download_with_retries(
-                assembly_accession,
-                assembly_name,
-                output_dir,
-                retries=args.retries,
-                retry_delay=args.retry_delay,
-            )
-        except Exception as exc:
-            logging.error("Failed to download %s after retries: %s", assembly_accession, exc)
-            failed_accessions.append(assembly_accession)
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, args.download_workers)) as executor:
+            futures = [
+                executor.submit(
+                    download_single_row,
+                    row,
+                    output_dir,
+                    args.retries,
+                    args.retry_delay,
+                    directory_cache,
+                )
+                for _, row in df.iterrows()
+            ]
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Downloading genome FASTA files"):
+                failed_accession = future.result()
+                if failed_accession:
+                    failed_accessions.append(failed_accession)
+    finally:
+        directory_cache.close()
 
     unique_failed_accessions = sorted(set(failed_accessions))
     success_count = len(set(get_expected_accessions(df))) - len(unique_failed_accessions)

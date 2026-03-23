@@ -10,6 +10,7 @@ import argparse
 import re
 import sqlite3
 import threading
+import http.client
 from tqdm import tqdm
 import logging
 from typing import Tuple, Dict, List, Optional
@@ -325,6 +326,20 @@ def fetch_metadata(
             logging.error(f"Network error fetching BioSample {biosample_id}: {e}")
             break
         except requests.exceptions.RequestException as e:
+            if attempt < DEFAULT_FETCH_RETRIES:
+                cause = getattr(e, "__cause__", None)
+                if isinstance(cause, http.client.RemoteDisconnected) or "RemoteDisconnected" in str(e):
+                    backoff_seconds = DEFAULT_RETRY_BACKOFF * attempt
+                    logging.warning(
+                        "Transient connection error fetching BioSample %s on attempt %s/%s: %s. Retrying in %.1fs.",
+                        biosample_id,
+                        attempt,
+                        DEFAULT_FETCH_RETRIES,
+                        e,
+                        backoff_seconds,
+                    )
+                    time.sleep(backoff_seconds)
+                    continue
             logging.error(f"Network error fetching BioSample {biosample_id}: {e}")
             break
         except Exception as e:

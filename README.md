@@ -48,6 +48,7 @@ How `fetchm` uses request pacing:
 - with an API key: default worker count is `8`
 
 `fetchm` also keeps a persistent SQLite metadata cache inside each organism output directory so reruns do not need to refetch previously retrieved BioSample records.
+Sequence downloads also keep a small SQLite cache of resolved assembly directory paths inside the sequence output directory so reruns can skip repeated FTP path discovery.
 
 You can pass the key directly:
 
@@ -72,6 +73,12 @@ Optional worker override:
 
 ```bash
 fetchm metadata --input ncbi_dataset.tsv --outdir results/ --api-key YOUR_NCBI_API_KEY --workers 8
+```
+
+Optional sequence download worker override:
+
+```bash
+fetchm seq --input ncbi_clean.csv --outdir sequence_output --download-workers 4
 ```
 
 ## Usage
@@ -174,7 +181,7 @@ The harmonization report gives a quick completeness summary for the standardized
 ## Notes
 - `fetchm run` already includes sequence downloading.
 - `fetchm metadata` and `fetchm run` support `--ani`, `--checkm`, `--sleep`, `--api-key`, `--email`, and `--workers`.
-- `fetchm seq` supports `--host`, `--year`, `--country`, `--cont`, `--subcont`, `--retries`, `--retry-delay`, and `--check-only`.
+- `fetchm seq` supports `--host`, `--year`, `--country`, `--cont`, `--subcont`, `--retries`, `--retry-delay`, `--check-only`, and `--download-workers`.
 - Scatter plots are skipped automatically when the filtered dataset does not contain enough valid points.
 - Runtime depends strongly on dataset size, NCBI responsiveness, and network conditions.
 
