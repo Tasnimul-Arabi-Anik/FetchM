@@ -7,9 +7,9 @@ The tool is intended primarily for bacterial genomes. Metadata structures differ
 
 ## Features
 - Fetch `Isolation Source`, `Collection Date`, `Geographic Location`, and `Host` from NCBI BioSample.
-- Filter records by ANI status and optional CheckM completeness threshold.
+- Apply optional ANI-status and CheckM completeness filtering.
 - Standardize common missing-value strings and harmonize collection year and country names.
-- Generate summary tables, harmonization reports, and publication-ready plots.
+- Generate summary tables, harmonization reports, comprehensive Markdown and DOCX reports, and publication-ready plots.
 - Download genome FASTA files from NCBI FTP after filtering by host, year, country, continent, or subcontinent.
 - Audit an existing sequence directory with `--check-only`.
 
@@ -43,9 +43,9 @@ Official NCBI references:
 How `fetchm` uses request pacing:
 
 - without an API key: default request delay is `0.34` seconds
-- with an API key: default request delay is `0.12` seconds
+- with an API key: default request delay is `0.15` seconds
 - without an API key: default worker count is `3`
-- with an API key: default worker count is `8`
+- with an API key: default worker count is `6`
 
 `fetchm` also keeps a persistent SQLite metadata cache inside each organism output directory so reruns do not need to refetch previously retrieved BioSample records.
 Sequence downloads also keep a small SQLite cache of resolved assembly directory paths inside the sequence output directory so reruns can skip repeated FTP path discovery.
@@ -93,8 +93,9 @@ fetchm seq --input results/<organism>/metadata_output/ncbi_clean.csv --outdir re
 Common examples:
 
 ```bash
-fetchm metadata --input ncbi_dataset.tsv --outdir results/ --ani all
+fetchm metadata --input ncbi_dataset.tsv --outdir results/
 fetchm run --input ncbi_dataset.tsv --outdir results/ --checkm 95
+fetchm metadata --input ncbi_dataset.tsv --outdir results/ --ani OK
 fetchm seq --input ncbi_clean.csv --outdir sequence_output --country Bangladesh
 fetchm seq --input ncbi_clean.csv --outdir sequence_output --cont Asia
 fetchm seq --input ncbi_clean.csv --outdir sequence_output --check-only
@@ -160,6 +161,7 @@ Tips:
 
 - The file must be tab-separated.
 - Keep the original header names unchanged.
+- ANI filtering is disabled by default. Use `--ani OK`, `--ani Failed`, or other explicit values only when you want filtering.
 - `--checkm` is optional. If you do not provide it, no CheckM filtering is applied.
 
 ## Output
@@ -171,18 +173,28 @@ For each run, `fetchm` creates an organism-specific result directory containing:
 - `metadata_output/assembly_summary.csv`
 - `metadata_output/annotation_summary.csv`
 - `metadata_output/metadata_harmonization_report.csv`
+- `metadata_output/metadata_fetch_failures.csv`
+- `metadata_output/fetchm_report.md`
+- `metadata_output/fetchm_report.docx`
 - `figures/*.tiff`
 - `figures/Geographic Location_map.jpg`
 - `sequence/*.fna` when sequence downloading is enabled
 - `sequence/failed_accessions.txt` after sequence audit or download
 
 The harmonization report gives a quick completeness summary for the standardized metadata fields.
+The comprehensive reports summarize runtime, filters, metadata completeness, key observations, numeric summaries, generated outputs, and fetch-failure reasons.
+
+Missing metadata semantics:
+
+- `unknown`: the source metadata explicitly used a missing or unknown-style value such as `NA`, `missing`, or `unknown`
+- `absent`: FetchM could not retrieve or locate a usable value for that field from the linked metadata
 
 ## Notes
 - `fetchm run` already includes sequence downloading.
 - `fetchm metadata` and `fetchm run` support `--ani`, `--checkm`, `--sleep`, `--api-key`, `--email`, and `--workers`.
 - `fetchm seq` supports `--host`, `--year`, `--country`, `--cont`, `--subcont`, `--retries`, `--retry-delay`, `--check-only`, and `--download-workers`.
 - Scatter plots are skipped automatically when the filtered dataset does not contain enough valid points.
+- Successful runs now report total runtime together with the number of NCBI input rows processed.
 - Runtime depends strongly on dataset size, NCBI responsiveness, and network conditions.
 
 ## License

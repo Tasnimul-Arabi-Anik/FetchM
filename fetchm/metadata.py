@@ -11,13 +11,15 @@ import re
 import sqlite3
 import threading
 import http.client
+import ssl
 from tqdm import tqdm
 import logging
-from typing import Tuple, Dict, List, Optional
+from typing import Tuple, Dict, List, Optional, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import plotly.express as px
 import plotly.io as pio
 
+from fetchm.reporting import build_report_context, render_docx_report, render_markdown_report, format_duration
 from fetchm.sequence import add_sequence_arguments, run_sequence_downloads
 
 # Configure logging
@@ -74,6 +76,8 @@ MISSING_VALUE_TOKENS = {
     "unavailable",
 }
 DATE_YEAR_PATTERN = re.compile(r"(19|20)\d{2}")
+STATUS_ABSENT = "absent"
+STATUS_UNKNOWN = "unknown"
 
 # Cache to store fetched metadata
 metadata_cache: Dict[str, Tuple] = {}
@@ -162,6 +166,18 @@ class MetadataPersistentCache:
             self.conn.close()
 
 
+def classify_missing_value(value: object) -> str:
+    if pd.isna(value):
+        return STATUS_ABSENT
+
+    normalized = " ".join(str(value).strip().split())
+    if not normalized:
+        return STATUS_UNKNOWN
+    if normalized.lower() in MISSING_VALUE_TOKENS:
+        return STATUS_UNKNOWN
+    return "present"
+
+
 def load_data(input_file: str) -> pd.DataFrame:
     """Load the TSV file into a DataFrame."""
     try:
@@ -173,24 +189,40 @@ def load_data(input_file: str) -> pd.DataFrame:
         raise
 
 
-def filter_data(df: pd.DataFrame, checkm_threshold: float, ani_status_list: list) -> pd.DataFrame:
+def filter_data(df: pd.DataFrame, checkm_threshold: float, ani_status_list: list) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """Filter the DataFrame based on CheckM completeness and ANI Check status."""
     try:
         filtered_df = df
+        filter_summary: Dict[str, Any] = {
+            "total_input_rows": len(df),
+            "checkm_enabled": checkm_threshold is not None,
+            "checkm_threshold": checkm_threshold,
+            "checkm_removed_rows": 0,
+            "ani_enabled": "all" not in ani_status_list,
+            "ani_values": list(ani_status_list),
+            "ani_removed_rows": 0,
+        }
 
         # Apply CheckM filtering only if threshold is provided
         if checkm_threshold is not None:
+            before_count = len(filtered_df)
             filtered_df = filtered_df[
                 filtered_df["CheckM completeness"].notna() &
                 (filtered_df["CheckM completeness"] > checkm_threshold)
             ]
+            filter_summary["checkm_removed_rows"] = before_count - len(filtered_df)
 
         # Apply ANI filtering only if 'all' is not in the list
         if "all" not in ani_status_list:
+            before_count = len(filtered_df)
             filtered_df = filtered_df[filtered_df["ANI Check status"].isin(ani_status_list)]
+            filter_summary["ani_removed_rows"] = before_count - len(filtered_df)
+
+        filter_summary["retained_rows"] = len(filtered_df)
+        filter_summary["total_removed_rows"] = len(df) - len(filtered_df)
 
         logging.info(f"Data filtered with CheckM threshold {checkm_threshold} and ANI status {ani_status_list}")
-        return filtered_df
+        return filtered_df, filter_summary
 
     except Exception as e:
         logging.error(f"Error filtering data: {e}")
@@ -237,16 +269,16 @@ def fetch_metadata(
     email: Optional[str] = None,
     persistent_cache: Optional[MetadataPersistentCache] = None,
     rate_limiter: Optional[RequestRateLimiter] = None,
-) -> Tuple:
+) -> Tuple[Tuple, Dict[str, Any]]:
     """Fetch metadata from NCBI."""
     if biosample_id in metadata_cache:
-        return metadata_cache[biosample_id]
+        return metadata_cache[biosample_id], {"status": "cached", "reason": "memory_cache"}
 
     if persistent_cache is not None:
         cached_value = persistent_cache.get(biosample_id)
         if cached_value is not None:
             metadata_cache[biosample_id] = cached_value
-            return cached_value
+            return cached_value, {"status": "cached", "reason": "persistent_cache"}
 
     params = {
         "db": "biosample",
@@ -271,26 +303,26 @@ def fetch_metadata(
             biosample_set = data.get("BioSampleSet")
             if not biosample_set or not isinstance(biosample_set, dict):
                 logging.warning(f"No 'BioSampleSet' found for BioSample {biosample_id}")
-                return pd.NA, pd.NA, pd.NA, pd.NA
+                return (pd.NA, pd.NA, pd.NA, pd.NA), {"status": "missing", "reason": "no_biosampleset"}
 
             biosample = biosample_set.get("BioSample")
             if isinstance(biosample, list):
                 biosample = biosample[0] if biosample else None
             if not biosample or not isinstance(biosample, dict):
                 logging.warning(f"No 'BioSample' found for BioSample {biosample_id}")
-                return pd.NA, pd.NA, pd.NA, pd.NA
+                return (pd.NA, pd.NA, pd.NA, pd.NA), {"status": "missing", "reason": "no_biosample"}
 
             attributes_node = biosample.get("Attributes") or {}
             if not isinstance(attributes_node, dict):
                 logging.warning(f"No 'Attributes' found for BioSample {biosample_id}")
-                return pd.NA, pd.NA, pd.NA, pd.NA
+                return (pd.NA, pd.NA, pd.NA, pd.NA), {"status": "missing", "reason": "no_attributes"}
 
             attributes = attributes_node.get("Attribute", [])
             if isinstance(attributes, dict):
                 attributes = [attributes]
             if not attributes:
                 logging.warning(f"No 'Attributes' found for BioSample {biosample_id}")
-                return pd.NA, pd.NA, pd.NA, pd.NA
+                return (pd.NA, pd.NA, pd.NA, pd.NA), {"status": "missing", "reason": "empty_attributes"}
 
             isolation_source = collection_date = geo_location = host = pd.NA
             for attr in attributes:
@@ -308,7 +340,7 @@ def fetch_metadata(
             metadata_cache[biosample_id] = metadata_tuple
             if persistent_cache is not None:
                 persistent_cache.set(biosample_id, metadata_tuple)
-            return metadata_tuple
+            return metadata_tuple, {"status": "ok", "reason": "fetched"}
         except requests.exceptions.HTTPError as e:
             status_code = e.response.status_code if e.response is not None else None
             if status_code in {429, 500, 502, 503, 504} and attempt < DEFAULT_FETCH_RETRIES:
@@ -328,7 +360,14 @@ def fetch_metadata(
         except requests.exceptions.RequestException as e:
             if attempt < DEFAULT_FETCH_RETRIES:
                 cause = getattr(e, "__cause__", None)
-                if isinstance(cause, http.client.RemoteDisconnected) or "RemoteDisconnected" in str(e):
+                if (
+                    isinstance(cause, http.client.RemoteDisconnected)
+                    or isinstance(cause, ssl.SSLError)
+                    or isinstance(e, requests.exceptions.SSLError)
+                    or "RemoteDisconnected" in str(e)
+                    or "SSLEOFError" in str(e)
+                    or "EOF occurred in violation of protocol" in str(e)
+                ):
                     backoff_seconds = DEFAULT_RETRY_BACKOFF * attempt
                     logging.warning(
                         "Transient connection error fetching BioSample %s on attempt %s/%s: %s. Retrying in %.1fs.",
@@ -340,15 +379,25 @@ def fetch_metadata(
                     )
                     time.sleep(backoff_seconds)
                     continue
+            error_reason = "ssl_eof_retry_exhausted" if (
+                isinstance(e, requests.exceptions.SSLError)
+                or "SSLEOFError" in str(e)
+                or "EOF occurred in violation of protocol" in str(e)
+            ) else "request_error"
             logging.error(f"Network error fetching BioSample {biosample_id}: {e}")
+            if CACHE_NEGATIVE_RESULTS:
+                metadata_cache[biosample_id] = (pd.NA, pd.NA, pd.NA, pd.NA)
+            return (pd.NA, pd.NA, pd.NA, pd.NA), {"status": "failed", "reason": error_reason}
             break
         except Exception as e:
             logging.error(f"Unexpected error fetching BioSample {biosample_id}: {e}")
-            break
+            if CACHE_NEGATIVE_RESULTS:
+                metadata_cache[biosample_id] = (pd.NA, pd.NA, pd.NA, pd.NA)
+            return (pd.NA, pd.NA, pd.NA, pd.NA), {"status": "failed", "reason": "unexpected_error"}
 
     if CACHE_NEGATIVE_RESULTS:
         metadata_cache[biosample_id] = (pd.NA, pd.NA, pd.NA, pd.NA)
-    return pd.NA, pd.NA, pd.NA, pd.NA
+    return (pd.NA, pd.NA, pd.NA, pd.NA), {"status": "failed", "reason": "request_error"}
 
 
 def fetch_all_metadata(
@@ -359,7 +408,7 @@ def fetch_all_metadata(
     persistent_cache: MetadataPersistentCache,
     request_interval: float,
     workers: int,
-) -> Dict[str, Tuple]:
+) -> Tuple[Dict[str, Tuple], Dict[str, Dict[str, Any]]]:
     rate_limiter = RequestRateLimiter(request_interval)
     unique_ids = []
     seen = set()
@@ -372,6 +421,7 @@ def fetch_all_metadata(
             unique_ids.append(biosample_str)
 
     results: Dict[str, Tuple] = {}
+    fetch_status: Dict[str, Dict[str, Any]] = {}
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_map = {
             executor.submit(
@@ -386,33 +436,35 @@ def fetch_all_metadata(
         }
         for future in tqdm(as_completed(future_map), total=len(future_map), desc="Fetching metadata"):
             biosample_id = future_map[future]
-            results[biosample_id] = future.result()
+            metadata_tuple, status_info = future.result()
+            results[biosample_id] = metadata_tuple
+            fetch_status[biosample_id] = status_info
 
-    return results
+    return results, fetch_status
 
 
 def standardize_date(date: str) -> str:
     """Standardize the 'Collection Date' column."""
     if pd.isna(date):
-        return "absent"
+        return STATUS_ABSENT
 
     cleaned = str(date).strip()
     if not cleaned:
-        return "absent"
+        return STATUS_UNKNOWN
 
     if cleaned.lower() in MISSING_VALUE_TOKENS:
-        return "absent"
+        return STATUS_UNKNOWN
 
     match = DATE_YEAR_PATTERN.search(cleaned)
     if not match:
-        return "absent"
+        return STATUS_UNKNOWN
 
     year = int(match.group(0))
     current_year = pd.Timestamp.utcnow().year
     if 1900 <= year <= current_year:
         return str(year)
 
-    return "absent"
+    return STATUS_UNKNOWN
 
 
 def normalize_missing_string(value: object) -> Optional[str]:
@@ -438,22 +490,33 @@ def normalize_title_case(value: str) -> str:
 
 
 def standardize_text_field(value: str) -> str:
-    normalized = normalize_missing_string(value)
-    if normalized is None:
-        return "absent"
+    if pd.isna(value):
+        return STATUS_ABSENT
+
+    normalized = " ".join(str(value).strip().split())
+    if not normalized:
+        return STATUS_UNKNOWN
+
+    if normalized.lower() in MISSING_VALUE_TOKENS:
+        return STATUS_UNKNOWN
 
     return normalized
 
 
 def standardize_location(location: str) -> str:
     """Standardize the 'Geographic Location' column."""
-    normalized = normalize_missing_string(location)
-    if normalized is None:
-        return "absent"
+    if pd.isna(location):
+        return STATUS_ABSENT
+
+    normalized = " ".join(str(location).strip().split())
+    if not normalized:
+        return STATUS_UNKNOWN
+    if normalized.lower() in MISSING_VALUE_TOKENS:
+        return STATUS_UNKNOWN
 
     country = normalized.split(":")[0].strip()
     normalized_country = normalize_country_name(country)
-    return normalized_country if normalized_country else "absent"
+    return normalized_country if normalized_country else STATUS_UNKNOWN
 
 
 def standardize_host(host: str) -> str:
@@ -713,8 +776,8 @@ def generate_harmonization_report(df: pd.DataFrame, output_file: str) -> None:
         total_rows = len(df)
         rows = []
         for column in tracked_columns:
-            absent_count = int((df[column] == "absent").sum()) if column in df.columns else 0
-            unknown_count = int((df[column] == "Unknown").sum()) if column in df.columns else 0
+            absent_count = int((df[column] == STATUS_ABSENT).sum()) if column in df.columns else 0
+            unknown_count = int((df[column] == STATUS_UNKNOWN).sum()) if column in df.columns else 0
             present_count = total_rows - absent_count - unknown_count
             completeness = 0.0 if total_rows == 0 else (present_count / total_rows) * 100
             rows.append(
@@ -732,6 +795,16 @@ def generate_harmonization_report(df: pd.DataFrame, output_file: str) -> None:
         logging.info("Metadata harmonization report saved to %s", output_file)
     except Exception as e:
         logging.error(f"Error generating metadata harmonization report: {e}")
+        raise
+
+
+def generate_fetch_failure_report(df: pd.DataFrame, output_file: str) -> None:
+    try:
+        failure_df = df[df["Metadata Fetch Status"] != "ok"].copy()
+        failure_df.to_csv(output_file, index=False)
+        logging.info("Metadata fetch failure report saved to %s", output_file)
+    except Exception as e:
+        logging.error(f"Error generating metadata fetch failure report: {e}")
         raise
 
 
@@ -1037,7 +1110,7 @@ def normalize_country_name(country):
 
 def extract_country(geo_location):
     """Extract country name from Geographic Location"""
-    if pd.isna(geo_location) or geo_location == "absent":
+    if pd.isna(geo_location) or geo_location in {STATUS_ABSENT, STATUS_UNKNOWN}:
         return None
     # Handle cases like "USA: New York" or "United States: California"
     raw_country = geo_location.split(":")[0].strip()
@@ -1050,10 +1123,15 @@ def add_geo_columns(df):
     df['Country'] = df['Geographic Location'].apply(extract_country)
     
     # Add continent and subcontinent with case-insensitive matching
-    df['Continent'] = df['Country'].apply(
-        lambda x: COUNTRY_MAPPING.get(x, {}).get('Continent', 'Unknown'))
-    df['Subcontinent'] = df['Country'].apply(
-        lambda x: COUNTRY_MAPPING.get(x, {}).get('Subcontinent', 'Unknown'))
+    def map_geo_region(row, key):
+        if row["Geographic Location"] == STATUS_ABSENT:
+            return STATUS_ABSENT
+        if row["Geographic Location"] == STATUS_UNKNOWN:
+            return STATUS_UNKNOWN
+        return COUNTRY_MAPPING.get(row["Country"], {}).get(key, STATUS_UNKNOWN)
+
+    df['Continent'] = df.apply(lambda row: map_geo_region(row, 'Continent'), axis=1)
+    df['Subcontinent'] = df.apply(lambda row: map_geo_region(row, 'Subcontinent'), axis=1)
     
     # Drop temporary Country column
     df = df.drop(columns=['Country'], errors='ignore')
@@ -1096,8 +1174,8 @@ def build_metadata_parser(*, add_help: bool = True) -> argparse.ArgumentParser:
             f"{DEFAULT_WORKERS_WITH_API_KEY} with an API key."
         ),
     )
-    parser.add_argument("--ani", nargs='+', choices=['OK', 'Inconclusive', 'Failed', 'all'], default=['OK'],
-    help="Filter genomes by ANI status. Choices: OK, Inconclusive, Failed, all. Default is OK.")   
+    parser.add_argument("--ani", nargs='+', choices=['OK', 'Inconclusive', 'Failed', 'all'], default=['all'],
+    help="Filter genomes by ANI status. Choices: OK, Inconclusive, Failed, all. Default is all (no ANI filtering).")   
     parser.add_argument("--checkm", type=float, default=None,
     help="Minimum CheckM completeness threshold. If not set, no CheckM filtering will be applied.")
     parser.add_argument("--seq", action="store_true", help="Run the script to download sequences")
@@ -1109,6 +1187,7 @@ def run_metadata_pipeline(args: argparse.Namespace) -> None:
     """Run the metadata workflow and optionally download sequences."""
 
     persistent_cache: Optional[MetadataPersistentCache] = None
+    start_time = time.monotonic()
     try:
         api_key = args.api_key or os.getenv("NCBI_API_KEY")
         effective_sleep = get_effective_sleep(args.sleep, api_key)
@@ -1128,7 +1207,8 @@ def run_metadata_pipeline(args: argparse.Namespace) -> None:
 
         # Load and filter data
         df = load_data(args.input)
-        df = filter_data(df, args.checkm, args.ani)
+        total_input_rows = len(df)
+        df, filter_summary = filter_data(df, args.checkm, args.ani)
 
         # Create output directories
         organism_name = df["Organism Name"].iloc[0].replace(" ", "_")
@@ -1142,7 +1222,7 @@ def run_metadata_pipeline(args: argparse.Namespace) -> None:
         df["Geographic Location"] = pd.NA
         df["Host"] = pd.NA
 
-        biosample_results = fetch_all_metadata(
+        biosample_results, fetch_status = fetch_all_metadata(
             df["Assembly BioSample Accession"].tolist(),
             api_key=api_key,
             email=args.email,
@@ -1150,6 +1230,9 @@ def run_metadata_pipeline(args: argparse.Namespace) -> None:
             request_interval=effective_sleep,
             workers=effective_workers,
         )
+
+        df["Metadata Fetch Status"] = STATUS_ABSENT
+        df["Metadata Fetch Reason"] = STATUS_ABSENT
 
         for index, row in df.iterrows():
             biosample_id = row["Assembly BioSample Accession"]
@@ -1162,6 +1245,9 @@ def run_metadata_pipeline(args: argparse.Namespace) -> None:
                 df.at[index, "Collection Date"] = collection_date
                 df.at[index, "Geographic Location"] = geo_location
                 df.at[index, "Host"] = host
+                status_info = fetch_status.get(str(biosample_id), {"status": "failed", "reason": "missing_status"})
+                df.at[index, "Metadata Fetch Status"] = status_info["status"]
+                df.at[index, "Metadata Fetch Reason"] = status_info["reason"]
 
         # Standardize columns
         df["Isolation Source"] = df["Isolation Source"].apply(standardize_isolation_source)
@@ -1218,7 +1304,7 @@ def run_metadata_pipeline(args: argparse.Namespace) -> None:
                 plot_distribution(column, series, column, figures_folder)
 
         # Filter and sort data for scatter plots
-        df3_filtered = df3[df3["Collection Date"] != "absent"].copy()
+        df3_filtered = df3[~df3["Collection Date"].isin([STATUS_ABSENT, STATUS_UNKNOWN])].copy()
         df3_filtered["Collection Date"] = pd.to_numeric(df3_filtered["Collection Date"], errors="coerce")
         df3_filtered = df3_filtered.dropna(subset=["Collection Date"])
         df3_filtered = df3_filtered.sort_values(by="Collection Date", ascending=True)
@@ -1266,6 +1352,34 @@ def run_metadata_pipeline(args: argparse.Namespace) -> None:
         save_clean_data(df4, columns_to_keep + ['Continent', 'Subcontinent'], clean_data_file)
         harmonization_report_file = os.path.join(metadata_folder, "metadata_harmonization_report.csv")
         generate_harmonization_report(df4, harmonization_report_file)
+        fetch_failure_report_file = os.path.join(metadata_folder, "metadata_fetch_failures.csv")
+        generate_fetch_failure_report(
+            df[
+                [
+                    "Assembly Accession",
+                    "Assembly Name",
+                    "Assembly BioSample Accession",
+                    "Metadata Fetch Status",
+                    "Metadata Fetch Reason",
+                    "Isolation Source",
+                    "Collection Date",
+                    "Geographic Location",
+                    "Host",
+                ]
+            ],
+            fetch_failure_report_file,
+        )
+
+        runtime_seconds = time.monotonic() - start_time
+        filters = {
+            "ANI filtering": "disabled" if "all" in args.ani else ", ".join(args.ani),
+            "CheckM threshold": "disabled" if args.checkm is None else str(args.checkm),
+            "NCBI API key used": "yes" if api_key else "no",
+            "NCBI request delay": f"{effective_sleep:.2f} seconds",
+            "Metadata workers": str(effective_workers),
+            "Sequence download requested": "yes" if args.seq else "no",
+            "Sequence download workers": str(getattr(args, "download_workers", "n/a")),
+        }
 
         # Generate and save bar plots for Continent and Subcontinent
         for variable in ["Continent", "Subcontinent"]:
@@ -1275,7 +1389,29 @@ def run_metadata_pipeline(args: argparse.Namespace) -> None:
         
         # Check if --seq argument is provided
         if not args.seq:
-            logging.info("Metadata generation completed. Sequence download not requested.")
+            report_context = build_report_context(
+                organism_name=organism_name,
+                input_file=args.input,
+                output_root=organism_folder,
+                mode="metadata",
+                total_input_rows=total_input_rows,
+                processed_rows=len(df),
+                unique_assemblies=df4["Assembly Accession"].nunique(),
+                runtime_seconds=runtime_seconds,
+                filters=filters,
+                filter_summary=filter_summary,
+                df_clean=df4,
+                df_annotation=df3,
+                fetch_status_df=df,
+            )
+            render_markdown_report(report_context, os.path.join(metadata_folder, "fetchm_report.md"))
+            render_docx_report(report_context, os.path.join(metadata_folder, "fetchm_report.docx"))
+            logging.info(
+                "fetchm metadata completed successfully in %s for %s NCBI input rows (%s rows processed after filtering).",
+                format_duration(runtime_seconds),
+                total_input_rows,
+                len(df),
+            )
             return
 
         run_sequence_downloads(
@@ -1283,7 +1419,30 @@ def run_metadata_pipeline(args: argparse.Namespace) -> None:
             input_path=clean_data_file,
             output_folder=sequence_folder,
         )
-        logging.info("Script completed successfully.")
+        runtime_seconds = time.monotonic() - start_time
+        report_context = build_report_context(
+            organism_name=organism_name,
+            input_file=args.input,
+            output_root=organism_folder,
+            mode="run",
+            total_input_rows=total_input_rows,
+            processed_rows=len(df),
+            unique_assemblies=df4["Assembly Accession"].nunique(),
+            runtime_seconds=runtime_seconds,
+            filters=filters,
+            filter_summary=filter_summary,
+            df_clean=df4,
+            df_annotation=df3,
+            fetch_status_df=df,
+        )
+        render_markdown_report(report_context, os.path.join(metadata_folder, "fetchm_report.md"))
+        render_docx_report(report_context, os.path.join(metadata_folder, "fetchm_report.docx"))
+        logging.info(
+            "fetchm run completed successfully in %s for %s NCBI input rows (%s rows processed after filtering).",
+            format_duration(runtime_seconds),
+            total_input_rows,
+            len(df),
+        )
 
     except Exception as e:
         logging.error(f"Script failed: {e}")

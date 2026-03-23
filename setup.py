@@ -2,7 +2,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="fetchm",
-    version="0.1.12",
+    version="0.1.13",
     author="Tasnimul Arabi Anik",
     author_email="arabianik987@gmail.com",
     description="A Python tool for fetching bacterial genome metadata and sequences.",
@@ -21,6 +21,7 @@ setup(
         "tqdm>=4.66",
         "plotly>=5.20",
         "kaleido>=0.2.1",
+        "python-docx>=1.1",
     ],
     classifiers=[
         "Programming Language :: Python :: 3",
