@@ -2,7 +2,7 @@ from setuptools import find_packages, setup
 
 setup(
     name="fetchm",
-    version="0.1.14",
+    version="0.1.15",
     author="Tasnimul Arabi Anik",
     author_email="arabianik987@gmail.com",
     description="A Python tool for fetching bacterial genome metadata and sequences.",

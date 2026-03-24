@@ -49,6 +49,7 @@ How `fetchm` uses request pacing:
 - when NCBI returns `429 Too Many Requests`, `fetchm` now increases the shared request interval automatically and gradually relaxes it again after stable success
 
 `fetchm` also keeps a persistent SQLite metadata cache inside each organism output directory so reruns do not need to refetch previously retrieved BioSample records.
+Confirmed non-transient outcomes such as successful fetches and source-missing records are cached, while transient fetch failures are retried on later runs.
 Sequence downloads also keep a small SQLite cache of resolved assembly directory paths inside the sequence output directory so reruns can skip repeated FTP path discovery.
 
 You can pass the key directly:
@@ -74,6 +75,12 @@ Optional worker override:
 
 ```bash
 fetchm metadata --input ncbi_dataset.tsv --outdir results/ --api-key YOUR_NCBI_API_KEY --workers 8
+```
+
+Resume a previous metadata run without refetching already-resolved BioSamples:
+
+```bash
+fetchm metadata --input ncbi_dataset.tsv --outdir results/ --resume-metadata
 ```
 
 Optional sequence download worker override:
@@ -200,6 +207,7 @@ Additional metadata notes:
 ## Notes
 - `fetchm run` already includes sequence downloading.
 - `fetchm metadata` and `fetchm run` support `--ani`, `--checkm`, `--sleep`, `--api-key`, `--email`, and `--workers`.
+- `fetchm metadata` also supports `--resume-metadata` for rerunning only unresolved metadata rows from a previous output directory.
 - `fetchm seq` supports `--host`, `--year`, `--country`, `--cont`, `--subcont`, `--retries`, `--retry-delay`, `--check-only`, and `--download-workers`.
 - Scatter plots are skipped automatically when the filtered dataset does not contain enough valid points.
 - Successful runs now report total runtime together with the number of NCBI input rows processed.

@@ -41,7 +41,7 @@ CACHE_NEGATIVE_RESULTS = False
 DEFAULT_FETCH_RETRIES = 3
 DEFAULT_RETRY_BACKOFF = 1.5
 CACHE_DB_FILENAME = "fetchm_metadata_cache.sqlite3"
-METADATA_CACHE_FORMAT_VERSION = 3
+METADATA_CACHE_FORMAT_VERSION = 4
 DEFAULT_RATE_PENALTY_MULTIPLIER = 1.5
 DEFAULT_RATE_RECOVERY_FACTOR = 0.95
 MAX_RATE_INTERVAL_MULTIPLIER = 6.0
@@ -144,7 +144,7 @@ HOST_ATTRIBUTE_KEYS = {
 }
 
 # Cache to store fetched metadata
-metadata_cache: Dict[str, Tuple] = {}
+metadata_cache: Dict[str, Tuple[Tuple, Dict[str, Any]]] = {}
 thread_local = threading.local()
 
 
@@ -238,7 +238,12 @@ class MetadataPersistentCache:
                     isolation_source TEXT,
                     collection_date TEXT,
                     geo_location TEXT,
-                    host TEXT
+                    host TEXT,
+                    fetch_status TEXT,
+                    fetch_reason TEXT,
+                    raw_attribute_names TEXT,
+                    matched_attribute_names TEXT,
+                    isolation_source_attribute_present INTEGER
                 )
                 """
             )
@@ -261,11 +266,20 @@ class MetadataPersistentCache:
                     (str(METADATA_CACHE_FORMAT_VERSION),),
                 )
 
-    def get(self, biosample_id: str) -> Optional[Tuple]:
+    def get(self, biosample_id: str) -> Optional[Tuple[Tuple, Dict[str, Any]]]:
         with self.lock:
             row = self.conn.execute(
                 """
-                SELECT isolation_source, collection_date, geo_location, host
+                SELECT
+                    isolation_source,
+                    collection_date,
+                    geo_location,
+                    host,
+                    fetch_status,
+                    fetch_reason,
+                    raw_attribute_names,
+                    matched_attribute_names,
+                    isolation_source_attribute_present
                 FROM biosample_metadata
                 WHERE biosample_id = ?
                 """,
@@ -273,23 +287,73 @@ class MetadataPersistentCache:
             ).fetchone()
         if row is None:
             return None
-        return tuple(pd.NA if value is None else value for value in row)
+        metadata_tuple = tuple(pd.NA if value is None else value for value in row[:4])
+        raw_attribute_names = row[6].split("|") if row[6] else []
+        matched_attribute_names: Dict[str, List[str]] = {}
+        if row[7]:
+            for field_entry in str(row[7]).split(" | "):
+                if not field_entry or ":" not in field_entry:
+                    continue
+                field_name, attr_names = field_entry.split(":", 1)
+                matched_attribute_names[field_name] = [name for name in attr_names.split(",") if name]
+        status_info = {
+            "status": row[4] or FETCH_STATUS_CACHED,
+            "reason": row[5] or "persistent_cache",
+            "raw_attribute_names": raw_attribute_names,
+            "matched_attribute_names": matched_attribute_names,
+            "isolation_source_attribute_present": bool(row[8]),
+            "cache_hit": True,
+        }
+        return metadata_tuple, status_info
 
-    def set(self, biosample_id: str, value: Tuple) -> None:
+    def set(self, biosample_id: str, value: Tuple, status_info: Dict[str, Any]) -> None:
+        status = status_info.get("status")
+        if status == FETCH_STATUS_FETCH_FAILED:
+            return
+
         serializable = tuple(None if pd.isna(item) else str(item) for item in value)
+        raw_attribute_names = "|".join(status_info.get("raw_attribute_names", [])) or None
+        matched_attribute_names = status_info.get("matched_attribute_names", {})
+        flattened_matches = []
+        for field_name, attr_names in matched_attribute_names.items():
+            if attr_names:
+                flattened_matches.append(f"{field_name}:{','.join(attr_names)}")
+        matched_serialized = " | ".join(flattened_matches) if flattened_matches else None
         with self.lock:
             self.conn.execute(
                 """
                 INSERT INTO biosample_metadata (
-                    biosample_id, isolation_source, collection_date, geo_location, host
-                ) VALUES (?, ?, ?, ?, ?)
+                    biosample_id,
+                    isolation_source,
+                    collection_date,
+                    geo_location,
+                    host,
+                    fetch_status,
+                    fetch_reason,
+                    raw_attribute_names,
+                    matched_attribute_names,
+                    isolation_source_attribute_present
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(biosample_id) DO UPDATE SET
                     isolation_source = excluded.isolation_source,
                     collection_date = excluded.collection_date,
                     geo_location = excluded.geo_location,
-                    host = excluded.host
+                    host = excluded.host,
+                    fetch_status = excluded.fetch_status,
+                    fetch_reason = excluded.fetch_reason,
+                    raw_attribute_names = excluded.raw_attribute_names,
+                    matched_attribute_names = excluded.matched_attribute_names,
+                    isolation_source_attribute_present = excluded.isolation_source_attribute_present
                 """,
-                (biosample_id, *serializable),
+                (
+                    biosample_id,
+                    *serializable,
+                    status,
+                    status_info.get("reason"),
+                    raw_attribute_names,
+                    matched_serialized,
+                    1 if status_info.get("isolation_source_attribute_present", False) else 0,
+                ),
             )
             self.conn.commit()
 
@@ -626,23 +690,13 @@ def fetch_metadata(
 ) -> Tuple[Tuple, Dict[str, Any]]:
     """Fetch metadata from NCBI."""
     if biosample_id in metadata_cache:
-        return metadata_cache[biosample_id], {
-            "status": FETCH_STATUS_CACHED,
-            "reason": "memory_cache",
-            "raw_attribute_names": [],
-            "matched_attribute_names": {},
-        }
+        return metadata_cache[biosample_id]
 
     if persistent_cache is not None:
         cached_value = persistent_cache.get(biosample_id)
         if cached_value is not None:
             metadata_cache[biosample_id] = cached_value
-            return cached_value, {
-                "status": FETCH_STATUS_CACHED,
-                "reason": "persistent_cache",
-                "raw_attribute_names": [],
-                "matched_attribute_names": {},
-            }
+            return cached_value
 
     params = build_ncbi_params(api_key, email, db="biosample", id=biosample_id, retmode="xml")
 
@@ -675,9 +729,9 @@ def fetch_metadata(
                             fallback_status,
                             "esummary_recovered_primary_missing",
                         )
-                        metadata_cache[biosample_id] = metadata_tuple
+                        metadata_cache[biosample_id] = (metadata_tuple, status_info)
                         if persistent_cache is not None:
-                            persistent_cache.set(biosample_id, metadata_tuple)
+                            persistent_cache.set(biosample_id, metadata_tuple, status_info)
                         return metadata_tuple, status_info
                     status_info = status_info_for_outcome(
                         classify_missing_fetch_reason(fallback_status.get("reason", primary_missing_reason)),
@@ -736,9 +790,9 @@ def fetch_metadata(
             if rate_limiter is not None:
                 rate_limiter.reward()
 
-            metadata_cache[biosample_id] = metadata_tuple
+            metadata_cache[biosample_id] = (metadata_tuple, status_info)
             if persistent_cache is not None:
-                persistent_cache.set(biosample_id, metadata_tuple)
+                persistent_cache.set(biosample_id, metadata_tuple, status_info)
             return metadata_tuple, status_info
         except requests.exceptions.HTTPError as e:
             status_code = e.response.status_code if e.response is not None else None
@@ -787,17 +841,17 @@ def fetch_metadata(
             ) else "request_error"
             logging.error(f"Network error fetching BioSample {biosample_id}: {e}")
             if CACHE_NEGATIVE_RESULTS:
-                metadata_cache[biosample_id] = (pd.NA, pd.NA, pd.NA, pd.NA)
+                metadata_cache[biosample_id] = ((pd.NA, pd.NA, pd.NA, pd.NA), status_info_for_outcome(FETCH_STATUS_FETCH_FAILED, error_reason))
             return (pd.NA, pd.NA, pd.NA, pd.NA), status_info_for_outcome(FETCH_STATUS_FETCH_FAILED, error_reason)
             break
         except Exception as e:
             logging.error(f"Unexpected error fetching BioSample {biosample_id}: {e}")
             if CACHE_NEGATIVE_RESULTS:
-                metadata_cache[biosample_id] = (pd.NA, pd.NA, pd.NA, pd.NA)
+                metadata_cache[biosample_id] = ((pd.NA, pd.NA, pd.NA, pd.NA), status_info_for_outcome(FETCH_STATUS_FETCH_FAILED, "unexpected_error"))
             return (pd.NA, pd.NA, pd.NA, pd.NA), status_info_for_outcome(FETCH_STATUS_FETCH_FAILED, "unexpected_error")
 
     if CACHE_NEGATIVE_RESULTS:
-        metadata_cache[biosample_id] = (pd.NA, pd.NA, pd.NA, pd.NA)
+        metadata_cache[biosample_id] = ((pd.NA, pd.NA, pd.NA, pd.NA), status_info_for_outcome(FETCH_STATUS_FETCH_FAILED, "request_error"))
     return (pd.NA, pd.NA, pd.NA, pd.NA), status_info_for_outcome(FETCH_STATUS_FETCH_FAILED, "request_error")
 
 
@@ -842,6 +896,36 @@ def fetch_all_metadata(
             fetch_status[biosample_id] = status_info
 
     return results, fetch_status
+
+
+def load_resume_metadata(
+    resume_file: str,
+    current_df: pd.DataFrame,
+) -> pd.DataFrame:
+    previous_df = pd.read_csv(resume_file, sep="\t", low_memory=False)
+    merge_columns = [
+        "Assembly Accession",
+        "Assembly BioSample Accession",
+        "Isolation Source",
+        "Collection Date",
+        "Geographic Location",
+        "Host",
+        "Metadata Raw Attribute Names",
+        "Metadata Matched Attribute Names",
+        "Metadata Fetch Status",
+        "Metadata Fetch Reason",
+        "Isolation Source Attribute Present",
+    ]
+    existing_columns = [col for col in merge_columns if col in previous_df.columns]
+    return current_df.merge(
+        previous_df[existing_columns].drop_duplicates(
+            subset=["Assembly Accession", "Assembly BioSample Accession"],
+            keep="first",
+        ),
+        on=["Assembly Accession", "Assembly BioSample Accession"],
+        how="left",
+        suffixes=("", "_resume"),
+    )
 
 
 def standardize_date(date: str) -> str:
@@ -1633,6 +1717,14 @@ def build_metadata_parser(*, add_help: bool = True) -> argparse.ArgumentParser:
     help="Filter genomes by ANI status. Choices: OK, Inconclusive, Failed, all. Default is all (no ANI filtering).")   
     parser.add_argument("--checkm", type=float, default=None,
     help="Minimum CheckM completeness threshold. If not set, no CheckM filtering will be applied.")
+    parser.add_argument(
+        "--resume-metadata",
+        action="store_true",
+        help=(
+            "Resume a previous metadata run from the existing ncbi_dataset_updated.tsv in the output directory. "
+            "Only rows with unresolved metadata fetch status will be retried."
+        ),
+    )
     parser.add_argument("--seq", action="store_true", help="Run the script to download sequences")
     add_sequence_arguments(parser, include_paths=False)
     return parser
@@ -1670,6 +1762,7 @@ def run_metadata_pipeline(args: argparse.Namespace) -> None:
         organism_folder, metadata_folder, figures_folder, sequence_folder = create_output_directory(args.outdir, organism_name)
         cache_db_path = os.path.join(organism_folder, CACHE_DB_FILENAME)
         persistent_cache = MetadataPersistentCache(cache_db_path)
+        resume_file = os.path.join(metadata_folder, "ncbi_dataset_updated.tsv")
 
         # Fetch metadata
         df["Isolation Source"] = pd.NA
@@ -1678,9 +1771,37 @@ def run_metadata_pipeline(args: argparse.Namespace) -> None:
         df["Host"] = pd.NA
         df["Metadata Raw Attribute Names"] = pd.NA
         df["Metadata Matched Attribute Names"] = pd.NA
+        df["Metadata Fetch Status"] = "not_fetched"
+        df["Metadata Fetch Reason"] = "not_fetched"
+        df["Isolation Source Attribute Present"] = False
+
+        if args.resume_metadata and os.path.exists(resume_file):
+            logging.info("Resuming metadata from %s", resume_file)
+            df = load_resume_metadata(resume_file, df)
+            for column in [
+                "Isolation Source",
+                "Collection Date",
+                "Geographic Location",
+                "Host",
+                "Metadata Raw Attribute Names",
+                "Metadata Matched Attribute Names",
+                "Metadata Fetch Status",
+                "Metadata Fetch Reason",
+                "Isolation Source Attribute Present",
+            ]:
+                resume_column = f"{column}_resume"
+                if resume_column in df.columns:
+                    df[column] = df[resume_column].combine_first(df[column])
+                    df = df.drop(columns=[resume_column])
+
+        unresolved_statuses = {"not_fetched", FETCH_STATUS_FETCH_FAILED}
+        biosample_ids_to_fetch = df.loc[
+            df["Metadata Fetch Status"].astype(str).isin(unresolved_statuses),
+            "Assembly BioSample Accession",
+        ].tolist()
 
         biosample_results, fetch_status = fetch_all_metadata(
-            df["Assembly BioSample Accession"].tolist(),
+            biosample_ids_to_fetch,
             api_key=api_key,
             email=args.email,
             persistent_cache=persistent_cache,
@@ -1688,15 +1809,14 @@ def run_metadata_pipeline(args: argparse.Namespace) -> None:
             workers=effective_workers,
         )
 
-        df["Metadata Fetch Status"] = "not_fetched"
-        df["Metadata Fetch Reason"] = "not_fetched"
-        df["Isolation Source Attribute Present"] = False
-
         for index, row in df.iterrows():
             biosample_id = row["Assembly BioSample Accession"]
             if pd.notna(biosample_id):
+                biosample_id_str = str(biosample_id)
+                if biosample_id_str not in fetch_status and str(row["Metadata Fetch Status"]) not in unresolved_statuses:
+                    continue
                 isolation_source, collection_date, geo_location, host = biosample_results.get(
-                    str(biosample_id),
+                    biosample_id_str,
                     (pd.NA, pd.NA, pd.NA, pd.NA),
                 )
                 df.at[index, "Isolation Source"] = isolation_source
@@ -1704,7 +1824,7 @@ def run_metadata_pipeline(args: argparse.Namespace) -> None:
                 df.at[index, "Geographic Location"] = geo_location
                 df.at[index, "Host"] = host
                 status_info = fetch_status.get(
-                    str(biosample_id),
+                    biosample_id_str,
                     status_info_for_outcome(FETCH_STATUS_FETCH_FAILED, "missing_status"),
                 )
                 df.at[index, "Isolation Source Attribute Present"] = bool(
