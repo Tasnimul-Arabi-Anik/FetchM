@@ -27,6 +27,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 # Constants
 NCBI_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+NCBI_ESEARCH_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+NCBI_ESUMMARY_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
 METADATA_FOLDER_NAME = "metadata_output"
 FIGURES_FOLDER_NAME = "figures"
 SEQUENCE_FOLDER_NAME = "sequence"
@@ -39,6 +41,10 @@ CACHE_NEGATIVE_RESULTS = False
 DEFAULT_FETCH_RETRIES = 3
 DEFAULT_RETRY_BACKOFF = 1.5
 CACHE_DB_FILENAME = "fetchm_metadata_cache.sqlite3"
+METADATA_CACHE_FORMAT_VERSION = 3
+DEFAULT_RATE_PENALTY_MULTIPLIER = 1.5
+DEFAULT_RATE_RECOVERY_FACTOR = 0.95
+MAX_RATE_INTERVAL_MULTIPLIER = 6.0
 MISSING_VALUE_TOKENS = {
     "",
     "unknown",
@@ -78,6 +84,64 @@ MISSING_VALUE_TOKENS = {
 DATE_YEAR_PATTERN = re.compile(r"(19|20)\d{2}")
 STATUS_ABSENT = "absent"
 STATUS_UNKNOWN = "unknown"
+FETCH_STATUS_OK = "ok"
+FETCH_STATUS_CACHED = "cached"
+FETCH_STATUS_SOURCE_MISSING = "source_missing"
+FETCH_STATUS_NOT_FOUND = "not_found"
+FETCH_STATUS_FETCH_FAILED = "fetch_failed"
+ISOLATION_SOURCE_ATTRIBUTE_KEYS = {
+    "isolation_source",
+    "isolation-source",
+    "isolation source",
+    "source_of_isolation",
+}
+ISOLATION_SOURCE_FALLBACK_ATTRIBUTE_KEYS = {
+    "sample_type",
+    "sample type",
+    "source_type",
+    "source type",
+    "env_broad_scale",
+    "broad-scale environmental context",
+    "env_local_scale",
+    "local-scale environmental context",
+    "env_medium",
+    "environmental medium",
+    "environment",
+    "environmental package",
+    "specimen",
+}
+ISOLATION_SOURCE_SEMANTIC_ATTRIBUTE_KEYS = {
+    *ISOLATION_SOURCE_ATTRIBUTE_KEYS,
+    *ISOLATION_SOURCE_FALLBACK_ATTRIBUTE_KEYS,
+    "isolation source host associated",
+    "isolation_source_host_associated",
+}
+COLLECTION_DATE_ATTRIBUTE_KEYS = {
+    "collection_date",
+    "collection-date",
+    "collection date",
+    "sample_collection_date",
+    "date_of_collection",
+    "isolation_date",
+}
+GEO_LOCATION_ATTRIBUTE_KEYS = {
+    "geo_loc_name",
+    "geo_loc name",
+    "geo-loc-name",
+    "geographic_location",
+    "geographic location",
+    "geographic_location_region_and_locality",
+    "geographic location region and locality",
+}
+HOST_ATTRIBUTE_KEYS = {
+    "host",
+    "host_scientific_name",
+    "host scientific name",
+    "host_common_name",
+    "host common name",
+    "specific_host",
+    "specific host",
+}
 
 # Cache to store fetched metadata
 metadata_cache: Dict[str, Tuple] = {}
@@ -94,9 +158,15 @@ def get_ncbi_session() -> requests.Session:
 
 class RequestRateLimiter:
     def __init__(self, interval_seconds: float) -> None:
-        self.interval_seconds = max(interval_seconds, 0.0)
+        self.base_interval_seconds = max(interval_seconds, 0.0)
+        self.interval_seconds = self.base_interval_seconds
+        self.max_interval_seconds = max(
+            self.base_interval_seconds * MAX_RATE_INTERVAL_MULTIPLIER,
+            self.base_interval_seconds + 1.0,
+        )
         self.lock = threading.Lock()
         self.next_allowed_time = 0.0
+        self.success_streak = 0
 
     def wait(self) -> None:
         with self.lock:
@@ -106,6 +176,42 @@ class RequestRateLimiter:
             self.next_allowed_time = scheduled_time
         if wait_time > 0:
             time.sleep(wait_time)
+
+    def penalize(self, *, reason: str) -> None:
+        with self.lock:
+            previous_interval = self.interval_seconds
+            self.interval_seconds = min(
+                self.max_interval_seconds,
+                max(self.base_interval_seconds, self.interval_seconds * DEFAULT_RATE_PENALTY_MULTIPLIER),
+            )
+            self.success_streak = 0
+            if self.interval_seconds > previous_interval:
+                logging.warning(
+                    "Adaptive rate limit increased request interval from %.2fs to %.2fs after %s.",
+                    previous_interval,
+                    self.interval_seconds,
+                    reason,
+                )
+
+    def reward(self) -> None:
+        if self.base_interval_seconds <= 0:
+            return
+        with self.lock:
+            self.success_streak += 1
+            if self.success_streak < 25 or self.interval_seconds <= self.base_interval_seconds:
+                return
+            previous_interval = self.interval_seconds
+            self.interval_seconds = max(
+                self.base_interval_seconds,
+                self.interval_seconds * DEFAULT_RATE_RECOVERY_FACTOR,
+            )
+            self.success_streak = 0
+            if self.interval_seconds < previous_interval:
+                logging.info(
+                    "Adaptive rate limit reduced request interval from %.2fs to %.2fs after stable request success.",
+                    previous_interval,
+                    self.interval_seconds,
+                )
 
 
 class MetadataPersistentCache:
@@ -119,6 +225,14 @@ class MetadataPersistentCache:
         with self.conn:
             self.conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS cache_metadata (
+                    cache_key TEXT PRIMARY KEY,
+                    cache_value TEXT
+                )
+                """
+            )
+            self.conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS biosample_metadata (
                     biosample_id TEXT PRIMARY KEY,
                     isolation_source TEXT,
@@ -128,6 +242,24 @@ class MetadataPersistentCache:
                 )
                 """
             )
+            row = self.conn.execute(
+                """
+                SELECT cache_value
+                FROM cache_metadata
+                WHERE cache_key = 'format_version'
+                """
+            ).fetchone()
+            cached_version = None if row is None else row[0]
+            if cached_version != str(METADATA_CACHE_FORMAT_VERSION):
+                self.conn.execute("DELETE FROM biosample_metadata")
+                self.conn.execute(
+                    """
+                    INSERT INTO cache_metadata (cache_key, cache_value)
+                    VALUES ('format_version', ?)
+                    ON CONFLICT(cache_key) DO UPDATE SET cache_value = excluded.cache_value
+                    """,
+                    (str(METADATA_CACHE_FORMAT_VERSION),),
+                )
 
     def get(self, biosample_id: str) -> Optional[Tuple]:
         with self.lock:
@@ -262,6 +394,228 @@ def get_effective_workers(workers: Optional[int], api_key: Optional[str]) -> int
     return DEFAULT_WORKERS_WITH_API_KEY if api_key else DEFAULT_WORKERS_NO_API_KEY
 
 
+def build_ncbi_params(api_key: Optional[str], email: Optional[str], **kwargs: Any) -> Dict[str, Any]:
+    params: Dict[str, Any] = {"tool": "fetchm", **kwargs}
+    if api_key:
+        params["api_key"] = api_key
+    if email:
+        params["email"] = email
+    return params
+
+
+def status_info_for_outcome(status: str, reason: str, **extra: Any) -> Dict[str, Any]:
+    info = {
+        "status": status,
+        "reason": reason,
+        "raw_attribute_names": [],
+        "matched_attribute_names": {},
+    }
+    info.update(extra)
+    return info
+
+
+def classify_missing_fetch_reason(reason: str) -> str:
+    if reason in {"esummary_no_uid"}:
+        return FETCH_STATUS_NOT_FOUND
+    if reason in {
+        "no_biosampleset",
+        "no_biosample",
+        "no_attributes",
+        "empty_attributes",
+        "esummary_no_sampledata",
+    }:
+        return FETCH_STATUS_SOURCE_MISSING
+    return FETCH_STATUS_FETCH_FAILED
+
+
+def extract_metadata_from_biosample_xml(xml_text: str) -> Tuple[Tuple, Dict[str, Any]]:
+    data = xmltodict.parse(xml_text)
+
+    biosample = data.get("BioSample")
+    if isinstance(biosample, list):
+        biosample = biosample[0] if biosample else None
+    if biosample is None:
+        biosample_set = data.get("BioSampleSet")
+        if not biosample_set or not isinstance(biosample_set, dict):
+            return (pd.NA, pd.NA, pd.NA, pd.NA), status_info_for_outcome(FETCH_STATUS_SOURCE_MISSING, "no_biosampleset")
+        biosample = biosample_set.get("BioSample")
+        if isinstance(biosample, list):
+            biosample = biosample[0] if biosample else None
+    if not biosample or not isinstance(biosample, dict):
+        return (pd.NA, pd.NA, pd.NA, pd.NA), status_info_for_outcome(FETCH_STATUS_SOURCE_MISSING, "no_biosample")
+
+    attributes_node = biosample.get("Attributes") or {}
+    if not isinstance(attributes_node, dict):
+        return (pd.NA, pd.NA, pd.NA, pd.NA), status_info_for_outcome(FETCH_STATUS_SOURCE_MISSING, "no_attributes")
+
+    attributes = attributes_node.get("Attribute", [])
+    if isinstance(attributes, dict):
+        attributes = [attributes]
+    if not attributes:
+        return (pd.NA, pd.NA, pd.NA, pd.NA), status_info_for_outcome(FETCH_STATUS_SOURCE_MISSING, "empty_attributes")
+
+    isolation_source = collection_date = geo_location = host = pd.NA
+    isolation_source_fallback = pd.NA
+    isolation_source_fallback_name = ""
+    raw_attribute_names: List[str] = []
+    matched_attribute_names: Dict[str, List[str]] = {
+        "Isolation Source": [],
+        "Collection Date": [],
+        "Geographic Location": [],
+        "Host": [],
+    }
+    isolation_source_attribute_present = False
+    for attr in attributes:
+        if isinstance(attr, dict):
+            attribute_name = attr.get("@attribute_name")
+            harmonized_name = attr.get("@harmonized_name")
+            display_name = attr.get("@display_name")
+            text_value = attr.get("#text", pd.NA)
+
+            raw_attribute_names.extend(
+                [value for value in [attribute_name, harmonized_name, display_name] if value]
+            )
+            candidate_keys = {
+                normalize_attribute_key(attribute_name),
+                normalize_attribute_key(harmonized_name),
+                normalize_attribute_key(display_name),
+            }
+            if candidate_keys & {normalize_attribute_key(value) for value in ISOLATION_SOURCE_SEMANTIC_ATTRIBUTE_KEYS}:
+                isolation_source_attribute_present = True
+
+            if pd.isna(isolation_source) and candidate_keys & {
+                normalize_attribute_key(value) for value in ISOLATION_SOURCE_ATTRIBUTE_KEYS
+            }:
+                isolation_source = text_value
+                matched_attribute_names["Isolation Source"].append(
+                    attribute_name or harmonized_name or display_name or ""
+                )
+            elif pd.isna(isolation_source_fallback) and candidate_keys & {
+                normalize_attribute_key(value) for value in ISOLATION_SOURCE_FALLBACK_ATTRIBUTE_KEYS
+            }:
+                isolation_source_fallback = text_value
+                isolation_source_fallback_name = attribute_name or harmonized_name or display_name or ""
+            elif pd.isna(collection_date) and candidate_keys & {
+                normalize_attribute_key(value) for value in COLLECTION_DATE_ATTRIBUTE_KEYS
+            }:
+                collection_date = text_value
+                matched_attribute_names["Collection Date"].append(
+                    attribute_name or harmonized_name or display_name or ""
+                )
+            elif pd.isna(geo_location) and candidate_keys & {
+                normalize_attribute_key(value) for value in GEO_LOCATION_ATTRIBUTE_KEYS
+            }:
+                geo_location = text_value
+                matched_attribute_names["Geographic Location"].append(
+                    attribute_name or harmonized_name or display_name or ""
+                )
+            elif pd.isna(host) and candidate_keys & {
+                normalize_attribute_key(value) for value in HOST_ATTRIBUTE_KEYS
+            }:
+                host = text_value
+                matched_attribute_names["Host"].append(
+                    attribute_name or harmonized_name or display_name or ""
+                )
+
+    if pd.isna(isolation_source) and not pd.isna(isolation_source_fallback):
+        isolation_source = isolation_source_fallback
+        matched_attribute_names["Isolation Source"].append(
+            isolation_source_fallback_name or "fallback_attribute"
+        )
+
+    accession = biosample.get("@accession")
+    ids_node = biosample.get("Ids") or {}
+    ids = ids_node.get("Id", []) if isinstance(ids_node, dict) else []
+    if isinstance(ids, dict):
+        ids = [ids]
+    known_accessions = []
+    for id_node in ids:
+        if isinstance(id_node, dict) and "#text" in id_node and id_node["#text"]:
+            known_accessions.append(str(id_node["#text"]))
+    if accession:
+        known_accessions.append(str(accession))
+    description = biosample.get("Description") or {}
+    organism_node = description.get("Organism") if isinstance(description, dict) else {}
+    if isinstance(organism_node, dict):
+        taxonomy_name = organism_node.get("@taxonomy_name") or organism_node.get("OrganismName")
+    else:
+        taxonomy_name = None
+
+    metadata_tuple = (isolation_source, collection_date, geo_location, host)
+    return metadata_tuple, {
+        "status": FETCH_STATUS_OK,
+        "reason": "fetched",
+        "raw_attribute_names": sorted(set(raw_attribute_names)),
+        "matched_attribute_names": matched_attribute_names,
+        "resolved_accession": accession,
+        "known_accessions": sorted(set(known_accessions)),
+        "taxonomy_name": taxonomy_name,
+        "isolation_source_attribute_present": isolation_source_attribute_present,
+    }
+
+
+def combine_status_metadata(primary: Dict[str, Any], fallback: Dict[str, Any], reason: str) -> Dict[str, Any]:
+    merged_names: Dict[str, List[str]] = {}
+    for key in ["Isolation Source", "Collection Date", "Geographic Location", "Host"]:
+        merged_names[key] = sorted(
+            set(primary.get("matched_attribute_names", {}).get(key, []))
+            | set(fallback.get("matched_attribute_names", {}).get(key, []))
+        )
+    return {
+        "status": FETCH_STATUS_OK,
+        "reason": reason,
+        "raw_attribute_names": sorted(
+            set(primary.get("raw_attribute_names", [])) | set(fallback.get("raw_attribute_names", []))
+        ),
+        "matched_attribute_names": merged_names,
+        "resolved_accession": fallback.get("resolved_accession") or primary.get("resolved_accession"),
+        "known_accessions": sorted(
+            set(primary.get("known_accessions", [])) | set(fallback.get("known_accessions", []))
+        ),
+        "taxonomy_name": fallback.get("taxonomy_name") or primary.get("taxonomy_name"),
+        "isolation_source_attribute_present": (
+            primary.get("isolation_source_attribute_present", False)
+            or fallback.get("isolation_source_attribute_present", False)
+        ),
+    }
+
+
+def fetch_metadata_via_esummary(
+    biosample_id: str,
+    *,
+    api_key: Optional[str],
+    email: Optional[str],
+    rate_limiter: Optional[RequestRateLimiter],
+) -> Tuple[Tuple, Dict[str, Any]]:
+    session = get_ncbi_session()
+    search_params = build_ncbi_params(api_key, email, db="biosample", term=f"{biosample_id}[accn]", retmode="json")
+
+    if rate_limiter is not None:
+        rate_limiter.wait()
+    search_response = session.get(NCBI_ESEARCH_URL, params=search_params, timeout=NCBI_TIMEOUT)
+    search_response.raise_for_status()
+    search_data = search_response.json()
+    uid_list = search_data.get("esearchresult", {}).get("idlist", [])
+    if not uid_list:
+        return (pd.NA, pd.NA, pd.NA, pd.NA), status_info_for_outcome(FETCH_STATUS_NOT_FOUND, "esummary_no_uid")
+
+    summary_params = build_ncbi_params(api_key, email, db="biosample", id=uid_list[0], retmode="json")
+    if rate_limiter is not None:
+        rate_limiter.wait()
+    summary_response = session.get(NCBI_ESUMMARY_URL, params=summary_params, timeout=NCBI_TIMEOUT)
+    summary_response.raise_for_status()
+    summary_data = summary_response.json()
+    summary_entry = summary_data.get("result", {}).get(uid_list[0], {})
+    sampledata = summary_entry.get("sampledata")
+    if not sampledata:
+        return (pd.NA, pd.NA, pd.NA, pd.NA), status_info_for_outcome(FETCH_STATUS_SOURCE_MISSING, "esummary_no_sampledata")
+
+    metadata_tuple, status_info = extract_metadata_from_biosample_xml(sampledata)
+    if status_info.get("status") == FETCH_STATUS_OK:
+        status_info["reason"] = "esummary_fetched"
+    return metadata_tuple, status_info
+
+
 def fetch_metadata(
     biosample_id: str,
     *,
@@ -272,24 +626,25 @@ def fetch_metadata(
 ) -> Tuple[Tuple, Dict[str, Any]]:
     """Fetch metadata from NCBI."""
     if biosample_id in metadata_cache:
-        return metadata_cache[biosample_id], {"status": "cached", "reason": "memory_cache"}
+        return metadata_cache[biosample_id], {
+            "status": FETCH_STATUS_CACHED,
+            "reason": "memory_cache",
+            "raw_attribute_names": [],
+            "matched_attribute_names": {},
+        }
 
     if persistent_cache is not None:
         cached_value = persistent_cache.get(biosample_id)
         if cached_value is not None:
             metadata_cache[biosample_id] = cached_value
-            return cached_value, {"status": "cached", "reason": "persistent_cache"}
+            return cached_value, {
+                "status": FETCH_STATUS_CACHED,
+                "reason": "persistent_cache",
+                "raw_attribute_names": [],
+                "matched_attribute_names": {},
+            }
 
-    params = {
-        "db": "biosample",
-        "id": biosample_id,
-        "retmode": "xml",
-        "tool": "fetchm",
-    }
-    if api_key:
-        params["api_key"] = api_key
-    if email:
-        params["email"] = email
+    params = build_ncbi_params(api_key, email, db="biosample", id=biosample_id, retmode="xml")
 
     for attempt in range(1, DEFAULT_FETCH_RETRIES + 1):
         try:
@@ -298,53 +653,99 @@ def fetch_metadata(
 
             response = get_ncbi_session().get(NCBI_URL, params=params, timeout=NCBI_TIMEOUT)
             response.raise_for_status()
-            data = xmltodict.parse(response.text)
+            metadata_tuple, status_info = extract_metadata_from_biosample_xml(response.text)
+            primary_missing_reason = status_info.get("reason")
+            if status_info.get("status") != FETCH_STATUS_OK:
+                if primary_missing_reason in {"no_biosampleset", "no_biosample", "no_attributes", "empty_attributes"}:
+                    logging.warning(
+                        "BioSample XML did not expose usable attributes for %s (%s).",
+                        biosample_id,
+                        primary_missing_reason,
+                    )
+                    fallback_tuple, fallback_status = fetch_metadata_via_esummary(
+                        biosample_id,
+                        api_key=api_key,
+                        email=email,
+                        rate_limiter=rate_limiter,
+                    )
+                    if fallback_status.get("status") == FETCH_STATUS_OK:
+                        metadata_tuple = fallback_tuple
+                        status_info = combine_status_metadata(
+                            status_info,
+                            fallback_status,
+                            "esummary_recovered_primary_missing",
+                        )
+                        metadata_cache[biosample_id] = metadata_tuple
+                        if persistent_cache is not None:
+                            persistent_cache.set(biosample_id, metadata_tuple)
+                        return metadata_tuple, status_info
+                    status_info = status_info_for_outcome(
+                        classify_missing_fetch_reason(fallback_status.get("reason", primary_missing_reason)),
+                        fallback_status.get("reason", primary_missing_reason),
+                        raw_attribute_names=fallback_status.get("raw_attribute_names", []),
+                        matched_attribute_names=fallback_status.get("matched_attribute_names", {}),
+                    )
+                return metadata_tuple, status_info
 
-            biosample_set = data.get("BioSampleSet")
-            if not biosample_set or not isinstance(biosample_set, dict):
-                logging.warning(f"No 'BioSampleSet' found for BioSample {biosample_id}")
-                return (pd.NA, pd.NA, pd.NA, pd.NA), {"status": "missing", "reason": "no_biosampleset"}
+            requested_accession = normalize_attribute_key(biosample_id)
+            known_accessions = {normalize_attribute_key(value) for value in status_info.get("known_accessions", [])}
+            xml_mismatch = requested_accession not in known_accessions
+            has_missing_fields = any(pd.isna(value) for value in metadata_tuple)
 
-            biosample = biosample_set.get("BioSample")
-            if isinstance(biosample, list):
-                biosample = biosample[0] if biosample else None
-            if not biosample or not isinstance(biosample, dict):
-                logging.warning(f"No 'BioSample' found for BioSample {biosample_id}")
-                return (pd.NA, pd.NA, pd.NA, pd.NA), {"status": "missing", "reason": "no_biosample"}
+            if xml_mismatch or has_missing_fields:
+                fallback_tuple, fallback_status = fetch_metadata_via_esummary(
+                    biosample_id,
+                    api_key=api_key,
+                    email=email,
+                    rate_limiter=rate_limiter,
+                )
+                if fallback_status.get("status") == FETCH_STATUS_OK:
+                    primary_taxonomy = normalize_attribute_key(status_info.get("taxonomy_name"))
+                    fallback_taxonomy = normalize_attribute_key(fallback_status.get("taxonomy_name"))
+                    taxonomy_conflict = (
+                        bool(primary_taxonomy)
+                        and bool(fallback_taxonomy)
+                        and primary_taxonomy != fallback_taxonomy
+                    )
+                    primary_present_count = sum(not pd.isna(value) for value in metadata_tuple)
+                    if xml_mismatch and (taxonomy_conflict or primary_present_count == 0):
+                        metadata_tuple = fallback_tuple
+                        status_info = combine_status_metadata(
+                            status_info,
+                            fallback_status,
+                            "esummary_replaced_xml_mismatch",
+                        )
+                    else:
+                        merged_tuple = tuple(
+                            fallback_value if pd.isna(primary_value) and not pd.isna(fallback_value) else primary_value
+                            for primary_value, fallback_value in zip(metadata_tuple, fallback_tuple)
+                        )
+                        if merged_tuple != metadata_tuple or xml_mismatch:
+                            metadata_tuple = merged_tuple
+                            status_info = combine_status_metadata(
+                                status_info,
+                                fallback_status,
+                                "esummary_filled_missing_fields",
+                            )
+                elif xml_mismatch:
+                    logging.warning(
+                        "BioSample XML accession mismatch for %s and esummary fallback did not recover the record (%s).",
+                        biosample_id,
+                        fallback_status.get("reason"),
+                    )
+            if rate_limiter is not None:
+                rate_limiter.reward()
 
-            attributes_node = biosample.get("Attributes") or {}
-            if not isinstance(attributes_node, dict):
-                logging.warning(f"No 'Attributes' found for BioSample {biosample_id}")
-                return (pd.NA, pd.NA, pd.NA, pd.NA), {"status": "missing", "reason": "no_attributes"}
-
-            attributes = attributes_node.get("Attribute", [])
-            if isinstance(attributes, dict):
-                attributes = [attributes]
-            if not attributes:
-                logging.warning(f"No 'Attributes' found for BioSample {biosample_id}")
-                return (pd.NA, pd.NA, pd.NA, pd.NA), {"status": "missing", "reason": "empty_attributes"}
-
-            isolation_source = collection_date = geo_location = host = pd.NA
-            for attr in attributes:
-                if isinstance(attr, dict):
-                    if attr.get("@attribute_name") == "isolation_source":
-                        isolation_source = attr.get("#text", pd.NA)
-                    elif attr.get("@attribute_name") == "collection_date":
-                        collection_date = attr.get("#text", pd.NA)
-                    elif attr.get("@attribute_name") == "geo_loc_name":
-                        geo_location = attr.get("#text", pd.NA)
-                    elif attr.get("@attribute_name") == "host":
-                        host = attr.get("#text", pd.NA)
-
-            metadata_tuple = (isolation_source, collection_date, geo_location, host)
             metadata_cache[biosample_id] = metadata_tuple
             if persistent_cache is not None:
                 persistent_cache.set(biosample_id, metadata_tuple)
-            return metadata_tuple, {"status": "ok", "reason": "fetched"}
+            return metadata_tuple, status_info
         except requests.exceptions.HTTPError as e:
             status_code = e.response.status_code if e.response is not None else None
             if status_code in {429, 500, 502, 503, 504} and attempt < DEFAULT_FETCH_RETRIES:
                 backoff_seconds = DEFAULT_RETRY_BACKOFF * attempt
+                if rate_limiter is not None and status_code == 429:
+                    rate_limiter.penalize(reason=f"http_{status_code}")
                 logging.warning(
                     "Transient HTTP error fetching BioSample %s on attempt %s/%s: %s. Retrying in %.1fs.",
                     biosample_id,
@@ -387,17 +788,17 @@ def fetch_metadata(
             logging.error(f"Network error fetching BioSample {biosample_id}: {e}")
             if CACHE_NEGATIVE_RESULTS:
                 metadata_cache[biosample_id] = (pd.NA, pd.NA, pd.NA, pd.NA)
-            return (pd.NA, pd.NA, pd.NA, pd.NA), {"status": "failed", "reason": error_reason}
+            return (pd.NA, pd.NA, pd.NA, pd.NA), status_info_for_outcome(FETCH_STATUS_FETCH_FAILED, error_reason)
             break
         except Exception as e:
             logging.error(f"Unexpected error fetching BioSample {biosample_id}: {e}")
             if CACHE_NEGATIVE_RESULTS:
                 metadata_cache[biosample_id] = (pd.NA, pd.NA, pd.NA, pd.NA)
-            return (pd.NA, pd.NA, pd.NA, pd.NA), {"status": "failed", "reason": "unexpected_error"}
+            return (pd.NA, pd.NA, pd.NA, pd.NA), status_info_for_outcome(FETCH_STATUS_FETCH_FAILED, "unexpected_error")
 
     if CACHE_NEGATIVE_RESULTS:
         metadata_cache[biosample_id] = (pd.NA, pd.NA, pd.NA, pd.NA)
-    return (pd.NA, pd.NA, pd.NA, pd.NA), {"status": "failed", "reason": "request_error"}
+    return (pd.NA, pd.NA, pd.NA, pd.NA), status_info_for_outcome(FETCH_STATUS_FETCH_FAILED, "request_error")
 
 
 def fetch_all_metadata(
@@ -478,6 +879,16 @@ def normalize_missing_string(value: object) -> Optional[str]:
     return normalized
 
 
+def normalize_attribute_key(value: object) -> str:
+    if value is None:
+        return ""
+
+    normalized = " ".join(str(value).strip().split()).lower()
+    normalized = normalized.replace("-", "_").replace(" ", "_")
+    normalized = re.sub(r"_+", "_", normalized)
+    return normalized.strip("_")
+
+
 def normalize_title_case(value: str) -> str:
     tokens = re.split(r"(\W+)", value)
     normalized_tokens = []
@@ -515,6 +926,8 @@ def standardize_location(location: str) -> str:
         return STATUS_UNKNOWN
 
     country = normalized.split(":")[0].strip()
+    if country.lower() in MISSING_VALUE_TOKENS:
+        return STATUS_UNKNOWN
     normalized_country = normalize_country_name(country)
     return normalized_country if normalized_country else STATUS_UNKNOWN
 
@@ -800,11 +1213,43 @@ def generate_harmonization_report(df: pd.DataFrame, output_file: str) -> None:
 
 def generate_fetch_failure_report(df: pd.DataFrame, output_file: str) -> None:
     try:
-        failure_df = df[df["Metadata Fetch Status"] != "ok"].copy()
+        unresolved_statuses = {FETCH_STATUS_FETCH_FAILED, FETCH_STATUS_SOURCE_MISSING, FETCH_STATUS_NOT_FOUND}
+        failure_df = df[df["Metadata Fetch Status"].isin(unresolved_statuses)].copy()
         failure_df.to_csv(output_file, index=False)
         logging.info("Metadata fetch failure report saved to %s", output_file)
     except Exception as e:
         logging.error(f"Error generating metadata fetch failure report: {e}")
+        raise
+
+
+def generate_unmatched_attribute_report(df: pd.DataFrame, output_file: str) -> None:
+    try:
+        success_statuses = {FETCH_STATUS_OK, FETCH_STATUS_CACHED}
+        tracked_columns = [
+            "Isolation Source",
+            "Collection Date",
+            "Geographic Location",
+            "Host",
+        ]
+        matched = df["Metadata Fetch Status"].isin(success_statuses)
+        still_absent = df[tracked_columns].eq(STATUS_ABSENT).any(axis=1)
+        report_df = df.loc[
+            matched & still_absent,
+            [
+                "Assembly Accession",
+                "Assembly Name",
+                "Assembly BioSample Accession",
+                "Metadata Fetch Status",
+                "Metadata Fetch Reason",
+                "Metadata Raw Attribute Names",
+                "Metadata Matched Attribute Names",
+                *tracked_columns,
+            ],
+        ].copy()
+        report_df.to_csv(output_file, index=False)
+        logging.info("Metadata unmatched attribute report saved to %s", output_file)
+    except Exception as e:
+        logging.error(f"Error generating metadata unmatched attribute report: {e}")
         raise
 
 
@@ -877,6 +1322,7 @@ COUNTRY_MAPPING = {
     "Chad": {"Continent": "Africa", "Subcontinent": "Middle Africa"},
     "Comoros": {"Continent": "Africa", "Subcontinent": "Eastern Africa"},
     "Congo": {"Continent": "Africa", "Subcontinent": "Middle Africa"},
+    "Republic of the Congo": {"Continent": "Africa", "Subcontinent": "Middle Africa"},
     "Democratic Republic of the Congo": {"Continent": "Africa", "Subcontinent": "Middle Africa"},
     "Djibouti": {"Continent": "Africa", "Subcontinent": "Eastern Africa"},
     "Egypt": {"Continent": "Africa", "Subcontinent": "Northern Africa"},
@@ -931,6 +1377,7 @@ COUNTRY_MAPPING = {
     "Brunei": {"Continent": "Asia", "Subcontinent": "South-Eastern Asia"},
     "Cambodia": {"Continent": "Asia", "Subcontinent": "South-Eastern Asia"},
     "China": {"Continent": "Asia", "Subcontinent": "Eastern Asia"},
+    "Hong Kong": {"Continent": "Asia", "Subcontinent": "Eastern Asia"},
     "Cyprus": {"Continent": "Asia", "Subcontinent": "Western Asia"},
     "Georgia": {"Continent": "Asia", "Subcontinent": "Western Asia"},
     "India": {"Continent": "Asia", "Subcontinent": "Southern Asia"},
@@ -951,6 +1398,7 @@ COUNTRY_MAPPING = {
     "Myanmar": {"Continent": "Asia", "Subcontinent": "South-Eastern Asia"},
     "Nepal": {"Continent": "Asia", "Subcontinent": "Southern Asia"},
     "North Korea": {"Continent": "Asia", "Subcontinent": "Eastern Asia"},
+    "Northern Asia": {"Continent": "Asia", "Subcontinent": "Northern Asia"},
     "Oman": {"Continent": "Asia", "Subcontinent": "Western Asia"},
     "Pakistan": {"Continent": "Asia", "Subcontinent": "Southern Asia"},
     "Palestine": {"Continent": "Asia", "Subcontinent": "Western Asia"},
@@ -965,6 +1413,7 @@ COUNTRY_MAPPING = {
     "Tajikistan": {"Continent": "Asia", "Subcontinent": "Central Asia"},
     "Thailand": {"Continent": "Asia", "Subcontinent": "South-Eastern Asia"},
     "Timor-Leste": {"Continent": "Asia", "Subcontinent": "South-Eastern Asia"},
+    "Taiwan": {"Continent": "Asia", "Subcontinent": "Eastern Asia"},
     "Turkey": {"Continent": "Asia", "Subcontinent": "Western Asia"},
     "Turkmenistan": {"Continent": "Asia", "Subcontinent": "Central Asia"},
     "United Arab Emirates": {"Continent": "Asia", "Subcontinent": "Western Asia"},
@@ -1060,6 +1509,7 @@ COUNTRY_MAPPING = {
     # Oceania (14 countries)
     "Australia": {"Continent": "Oceania", "Subcontinent": "Australia and New Zealand"},
     "Fiji": {"Continent": "Oceania", "Subcontinent": "Melanesia"},
+    "Guam": {"Continent": "Oceania", "Subcontinent": "Micronesia"},
     "Kiribati": {"Continent": "Oceania", "Subcontinent": "Micronesia"},
     "Marshall Islands": {"Continent": "Oceania", "Subcontinent": "Micronesia"},
     "Micronesia": {"Continent": "Oceania", "Subcontinent": "Micronesia"},
@@ -1084,6 +1534,9 @@ ALIASES = {
     "U.S.A.": "United States",
     "Viet Nam": "Vietnam",
     "DRC": "Democratic Republic of the Congo",
+    "Republic Of The Congo": "Republic of the Congo",
+    "Taiwan, Province Of China": "Taiwan",
+    "Hong Kong SAR": "Hong Kong",
 
 }
 
@@ -1094,6 +1547,8 @@ def normalize_country_name(country):
         
     # Convert to string and strip whitespace
     country = str(country).strip()
+    if country.lower() in MISSING_VALUE_TOKENS:
+        return None
     
     # Check aliases first
     if country in ALIASES:
@@ -1221,6 +1676,8 @@ def run_metadata_pipeline(args: argparse.Namespace) -> None:
         df["Collection Date"] = pd.NA
         df["Geographic Location"] = pd.NA
         df["Host"] = pd.NA
+        df["Metadata Raw Attribute Names"] = pd.NA
+        df["Metadata Matched Attribute Names"] = pd.NA
 
         biosample_results, fetch_status = fetch_all_metadata(
             df["Assembly BioSample Accession"].tolist(),
@@ -1231,8 +1688,9 @@ def run_metadata_pipeline(args: argparse.Namespace) -> None:
             workers=effective_workers,
         )
 
-        df["Metadata Fetch Status"] = STATUS_ABSENT
-        df["Metadata Fetch Reason"] = STATUS_ABSENT
+        df["Metadata Fetch Status"] = "not_fetched"
+        df["Metadata Fetch Reason"] = "not_fetched"
+        df["Isolation Source Attribute Present"] = False
 
         for index, row in df.iterrows():
             biosample_id = row["Assembly BioSample Accession"]
@@ -1245,9 +1703,30 @@ def run_metadata_pipeline(args: argparse.Namespace) -> None:
                 df.at[index, "Collection Date"] = collection_date
                 df.at[index, "Geographic Location"] = geo_location
                 df.at[index, "Host"] = host
-                status_info = fetch_status.get(str(biosample_id), {"status": "failed", "reason": "missing_status"})
+                status_info = fetch_status.get(
+                    str(biosample_id),
+                    status_info_for_outcome(FETCH_STATUS_FETCH_FAILED, "missing_status"),
+                )
+                df.at[index, "Isolation Source Attribute Present"] = bool(
+                    status_info.get("isolation_source_attribute_present", False)
+                )
                 df.at[index, "Metadata Fetch Status"] = status_info["status"]
                 df.at[index, "Metadata Fetch Reason"] = status_info["reason"]
+                raw_attribute_names = status_info.get("raw_attribute_names", [])
+                matched_attribute_names = status_info.get("matched_attribute_names", {})
+                df.at[index, "Metadata Raw Attribute Names"] = "|".join(raw_attribute_names) if raw_attribute_names else STATUS_ABSENT
+                if matched_attribute_names:
+                    flattened_matches = []
+                    for field_name, attr_names in matched_attribute_names.items():
+                        if attr_names:
+                            flattened_matches.append(f"{field_name}:{','.join(attr_names)}")
+                    df.at[index, "Metadata Matched Attribute Names"] = (
+                        " | ".join(flattened_matches) if flattened_matches else STATUS_ABSENT
+                    )
+                if pd.isna(isolation_source) and status_info.get("isolation_source_attribute_present", False):
+                    df.at[index, "Isolation Source"] = STATUS_UNKNOWN
+                else:
+                    df.at[index, "Metadata Matched Attribute Names"] = STATUS_ABSENT
 
         # Standardize columns
         df["Isolation Source"] = df["Isolation Source"].apply(standardize_isolation_source)
@@ -1368,6 +1847,25 @@ def run_metadata_pipeline(args: argparse.Namespace) -> None:
                 ]
             ],
             fetch_failure_report_file,
+        )
+        unmatched_attribute_report_file = os.path.join(metadata_folder, "metadata_unmatched_attributes.csv")
+        generate_unmatched_attribute_report(
+            df[
+                [
+                    "Assembly Accession",
+                    "Assembly Name",
+                    "Assembly BioSample Accession",
+                    "Metadata Fetch Status",
+                    "Metadata Fetch Reason",
+                    "Metadata Raw Attribute Names",
+                    "Metadata Matched Attribute Names",
+                    "Isolation Source",
+                    "Collection Date",
+                    "Geographic Location",
+                    "Host",
+                ]
+            ],
+            unmatched_attribute_report_file,
         )
 
         runtime_seconds = time.monotonic() - start_time

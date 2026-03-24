@@ -46,6 +46,7 @@ How `fetchm` uses request pacing:
 - with an API key: default request delay is `0.15` seconds
 - without an API key: default worker count is `3`
 - with an API key: default worker count is `6`
+- when NCBI returns `429 Too Many Requests`, `fetchm` now increases the shared request interval automatically and gradually relaxes it again after stable success
 
 `fetchm` also keeps a persistent SQLite metadata cache inside each organism output directory so reruns do not need to refetch previously retrieved BioSample records.
 Sequence downloads also keep a small SQLite cache of resolved assembly directory paths inside the sequence output directory so reruns can skip repeated FTP path discovery.
@@ -183,11 +184,18 @@ For each run, `fetchm` creates an organism-specific result directory containing:
 
 The harmonization report gives a quick completeness summary for the standardized metadata fields.
 The comprehensive reports summarize runtime, filters, metadata completeness, key observations, numeric summaries, generated outputs, and fetch-failure reasons.
+Metadata fetching now uses the BioSample E-utilities XML route first and falls back to the NCBI BioSample summary payload when the primary record is incomplete or resolves to the wrong accession.
 
 Missing metadata semantics:
 
 - `unknown`: the source metadata explicitly used a missing or unknown-style value such as `NA`, `missing`, or `unknown`
 - `absent`: FetchM could not retrieve or locate a usable value for that field from the linked metadata
+- `Metadata Fetch Status` values include `ok`, `cached`, `source_missing`, `not_found`, and `fetch_failed`
+
+Additional metadata notes:
+
+- Geographic labels such as `Taiwan`, `Hong Kong`, `Guam`, and `Republic of the Congo` are normalized for continent and subcontinent assignment.
+- Isolation-source classification is conservative: rows with source-like attributes but missing-style values are treated as `unknown`, while broad source absence remains `absent`.
 
 ## Notes
 - `fetchm run` already includes sequence downloading.
