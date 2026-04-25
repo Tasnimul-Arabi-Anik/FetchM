@@ -1117,16 +1117,28 @@ def plot_geo_choropleth(variable: str, frequency: pd.Series, figures_folder: str
             ),
             margin=dict(l=20, r=20, t=60, b=20)
         )
-
-        # Save as high-resolution image
-        figure_path = os.path.join(figures_folder, f"{variable}_map.jpg")
-        pio.write_image(fig, figure_path, format="jpg", scale=4)
-
-        logging.info(f"Map plot saved for {variable}")
-
     except Exception as e:
-        logging.error(f"Error generating map plot for {variable}: {e}")
-        raise
+        logging.warning(f"Could not build map plot for {variable}: {e}")
+        return
+
+    figure_path = os.path.join(figures_folder, f"{variable}_map.jpg")
+    try:
+        # Save as high-resolution image
+        pio.write_image(fig, figure_path, format="jpg", scale=4)
+        logging.info(f"Map plot saved for {variable}")
+    except Exception as e:
+        html_path = os.path.join(figures_folder, f"{variable}_map.html")
+        try:
+            fig.write_html(html_path, include_plotlyjs="cdn")
+            logging.warning(
+                f"Static map export unavailable for {variable}: {e}. "
+                f"Saved interactive HTML map to {html_path}."
+            )
+        except Exception as html_error:
+            logging.warning(
+                f"Static map export unavailable for {variable}: {e}. "
+                f"Could not save fallback HTML map: {html_error}."
+            )
 
 
 def plot_distribution(column: str, data: pd.Series, title: str, figures_folder: str) -> None:

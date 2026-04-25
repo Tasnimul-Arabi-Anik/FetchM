@@ -20,7 +20,7 @@ setup(
         "scipy>=1.11",
         "tqdm>=4.66",
         "plotly>=5.20",
-        "kaleido>=0.2.1",
+        "kaleido>=0.2.1,<1.0.0",
         "python-docx>=1.1",
     ],
     classifiers=[

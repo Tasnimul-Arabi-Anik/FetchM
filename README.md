@@ -367,7 +367,7 @@ For each run, `fetchm` creates an organism-specific result directory containing:
 - `metadata_output/fetchm_report.docx`
 - `figures/*.png`
 - `figures/*.tiff`
-- `figures/Geographic Location_map.jpg`
+- `figures/Geographic Location_map.jpg` or `figures/Geographic Location_map.html` when static map export is unavailable
 - `sequence/*.fna` when sequence downloading is enabled
 - `sequence/failed_accessions.txt` after sequence audit or download
 
@@ -383,6 +383,7 @@ Additional metadata notes:
 
 - geographic labels such as `Taiwan`, `Hong Kong`, `Guam`, and `Republic of the Congo` are normalized for continent and subcontinent assignment
 - isolation-source classification is conservative: rows with source-like attributes but missing-style values are treated as `unknown`, while broad source absence remains `absent`
+- static geographic map export uses Kaleido when available; on headless systems without a compatible static export backend, `fetchm` writes an interactive HTML map and continues instead of requiring Google Chrome
 
 ## Example Figures
 The repository includes example figure files that can be linked directly from the `figures/` directory:
